@@ -72,7 +72,7 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
         nonlocal _call_count, _sage_count, _fallback_count
         _call_count += 1
 
-        # Log first 3 calls with shape/dtype info
+        # Log first 5 unique shapes with dtype info
         shape_key = f"{query.shape}_{query.dtype}"
         if shape_key not in _logged_shapes and len(_logged_shapes) < 5:
             _logged_shapes.add(shape_key)
@@ -83,7 +83,7 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
                 f"causal={is_causal}, scale={scale}"
             )
 
-        # Fallback: custom attention mask
+        # Fallback: custom attention mask (не поддерживается SageAttention)
         if attn_mask is not None:
             _fallback_count += 1
             if _fallback_count == 1:
@@ -91,7 +91,7 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
             return _original(query, key, value, attn_mask=attn_mask,
                              dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
-        # Fallback: dropout (not supported in INT8 path)
+        # Fallback: dropout
         if dropout_p > 0.0:
             _fallback_count += 1
             if _fallback_count == 1:
@@ -99,18 +99,21 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
             return _original(query, key, value, attn_mask=attn_mask,
                              dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
-        # Fallback: non-FP16/BF16 tensor dtypes
-        dtype = query.dtype
-        if dtype not in (torch.float16, torch.bfloat16):
-            _fallback_count += 1
-            if _fallback_count == 1:
-                logger.info(f"[SageAttention] fallback #{_fallback_count}: dtype={dtype}")
-            return _original(query, key, value, attn_mask=attn_mask,
-                             dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+        # Auto-convert FP32 → FP16 для SageAttention INT8 kernel
+        # (LTX модели часто работают в float32, но INT8 тензорные ядра T4
+        #  дают огромное ускорение даже с конвертацией туда-обратно)
+        need_convert_back = query.dtype == torch.float32
+        if need_convert_back:
+            q = query.half()
+            k = key.half()
+            v = value.half()
+        else:
+            q = query
+            k = key
+            v = value
 
         # Detect layout: HND [B,H,L,D] vs NHD [B,L,H,D]
-        # heads (shape[1]) is typically much smaller than seq_len (shape[2])
-        if query.shape[1] < query.shape[2]:
+        if q.shape[1] < q.shape[2]:
             tensor_layout = "HND"
         else:
             tensor_layout = "NHD"
@@ -118,7 +121,7 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
         try:
             _sage_count += 1
             result = sageattn_fn(
-                query.contiguous(), key.contiguous(), value.contiguous(),
+                q.contiguous(), k.contiguous(), v.contiguous(),
                 tensor_layout=tensor_layout,
                 is_causal=is_causal,
                 sm_scale=scale,
@@ -126,6 +129,10 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
                 smooth_k=smooth_k,
                 qk_quant_gran=qk_quant_gran,
             )
+            # Convert back to original dtype if needed
+            if need_convert_back:
+                result = result.to(dtype=torch.float32)
+
             # Log summary every 100 successful calls
             if _sage_count % 100 == 0:
                 logger.info(

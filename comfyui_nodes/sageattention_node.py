@@ -85,8 +85,8 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
             logged_shapes.add(shape_key)
             logger.info(
                 f"[SageAttention] call #{call_count}: "
-                f"q.shape={tuple(q.shape)}, dtype={q.dtype}, "
-                f"heads={heads}, mask={mask is not None}, "
+                f"q.shape={tuple(q.shape)}, k.shape={tuple(k.shape)}, v.shape={tuple(v.shape)}, "
+                f"dtype={q.dtype}, heads={heads}, mask={mask is not None}, "
                 f"skip_reshape={skip_reshape}"
             )
 
@@ -103,7 +103,8 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
                              skip_output_reshape=skip_output_reshape,
                              attn_precision=attn_precision, **kwargs)
 
-        # --- Save original dtype for output conversion ---
+        # --- Save original q for fallback (unchanged) ---
+        q_orig, k_orig, v_orig = q, k, v
         in_dtype = v.dtype
 
         # --- FP32 → FP16 (SageAttention SM75 требует FP16) ---
@@ -114,22 +115,26 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
         else:
             q_h, k_h, v_h = q, k, v
 
-        # --- Reshape to SageAttention layout ---
-        if skip_reshape:
-            # Input: [B, H, L, D] — heads already split (HND layout)
-            b, h, l, dim_head = q_h.shape
-            tensor_layout = "HND"
-        else:
-            # Input: [B, L, H*D] — need to split heads
-            b, l, dim_head = q_h.shape
-            dim_head //= heads
-            q_h = q_h.view(b, l, heads, dim_head)
-            k_h = k_h.view(b, l, heads, dim_head)
-            v_h = v_h.view(b, l, heads, dim_head)
-            tensor_layout = "NHD"
-
-        # --- Call SageAttention ---
+        # --- Весь вызов SageAttention под единым try/except ---
+        # (reshape + kernel могут упасть на cross-attention с разными Lq/Lk)
         try:
+            if skip_reshape:
+                # Input: [B, H, L, D] — heads already split (HND layout)
+                b, h, l, dim_head = q_h.shape
+                tensor_layout = "HND"
+                # В HND формате reshape не нужен — передаём как есть
+            else:
+                # Input: [B, L, H*D] → [B, L, H, D] (NHD)
+                b, dim_head = q_h.shape[0], q_h.shape[-1]
+                dim_head //= heads
+                # Q: [B, Lq, H*D] → [B, Lq, H, D] — l_q берём из q
+                q_h = q_h.view(b, -1, heads, dim_head)
+                l = q_h.shape[1]  # seq_len Q для output reshape
+                # K/V: [B, Lk, H*D] → [B, Lk, H, D] — -1 для разной длины
+                k_h = k_h.view(b, -1, heads, dim_head)
+                v_h = v_h.view(b, -1, heads, dim_head)
+                tensor_layout = "NHD"
+
             result = sageattn_fn(
                 q_h.contiguous(), k_h.contiguous(), v_h.contiguous(),
                 tensor_layout=tensor_layout,
@@ -168,7 +173,7 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
                 logger.warning(
                     f"[SageAttention] kernel FAILED #{fallback_err_count}: {e}"
                 )
-            return _fallback(q, k, v, heads, mask=mask,
+            return _fallback(q_orig, k_orig, v_orig, heads, mask=mask,
                              skip_reshape=skip_reshape,
                              skip_output_reshape=skip_output_reshape,
                              attn_precision=attn_precision, **kwargs)

@@ -61,22 +61,19 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
     if not available:
         raise RuntimeError("SageAttention not installed")
 
-    # Counters (reset per node execution — acceptable)
-    call_count = 0
-    sage_ok_count = 0
-    fallback_mask_count = 0
-    fallback_err_count = 0
-    logged_shapes = set()
+    # Self-disable: после N последовательных неудач больше не пытаемся
+    # (каждый вызов sageattn с падением платит overhead FP32→FP16 + reshape)
+    _kernel_broken = False
+    _max_fails = 3
 
     def attention_sage_t4(q, k, v, heads, mask=None, attn_precision=None,
                           skip_reshape=False, skip_output_reshape=False, **kwargs):
         """
         SageAttention SM75 override for ComfyUI optimized_attention.
 
-        Call chain:
-          wrap_attn → override(func, q, k, v, heads, ...) → attention_sage_t4(q, k, v, heads, ...)
+        Self-disable: после {_max_fails} неудач просто вызывает fallback.
         """
-        nonlocal call_count, sage_ok_count, fallback_mask_count, fallback_err_count
+        nonlocal call_count, sage_ok_count, fallback_mask_count, fallback_err_count, _kernel_broken
         call_count += 1
 
         # --- Diagnostic: log first 3 unique shapes ---
@@ -89,6 +86,15 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
                 f"dtype={q.dtype}, heads={heads}, mask={mask is not None}, "
                 f"skip_reshape={skip_reshape}"
             )
+
+        # --- Self-disable: kernel не работает → fallback без overhead ---
+        if _kernel_broken:
+            if call_count % 500 == 0:  # редко напоминаем
+                logger.info(f"[SageAttention] self-disabled ({fallback_err_count} fails)")
+            return _fallback(q, k, v, heads, mask=mask,
+                             skip_reshape=skip_reshape,
+                             skip_output_reshape=skip_output_reshape,
+                             attn_precision=attn_precision, **kwargs)
 
         # --- Fallback: mask (SageAttention SM75 не поддерживает кастомные маски) ---
         if mask is not None:
@@ -116,21 +122,15 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
             q_h, k_h, v_h = q, k, v
 
         # --- Весь вызов SageAttention под единым try/except ---
-        # (reshape + kernel могут упасть на cross-attention с разными Lq/Lk)
         try:
             if skip_reshape:
-                # Input: [B, H, L, D] — heads already split (HND layout)
                 b, h, l, dim_head = q_h.shape
                 tensor_layout = "HND"
-                # В HND формате reshape не нужен — передаём как есть
             else:
-                # Input: [B, L, H*D] → [B, L, H, D] (NHD)
                 b, dim_head = q_h.shape[0], q_h.shape[-1]
                 dim_head //= heads
-                # Q: [B, Lq, H*D] → [B, Lq, H, D] — l_q берём из q
                 q_h = q_h.view(b, -1, heads, dim_head)
-                l = q_h.shape[1]  # seq_len Q для output reshape
-                # K/V: [B, Lk, H*D] → [B, Lk, H, D] — -1 для разной длины
+                l = q_h.shape[1]
                 k_h = k_h.view(b, -1, heads, dim_head)
                 v_h = v_h.view(b, -1, heads, dim_head)
                 tensor_layout = "NHD"
@@ -143,11 +143,8 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
                 qk_quant_gran=qk_quant_gran,
             )
             sage_ok_count += 1
-
-            # Convert back to original dtype (crucial for FP32 models)
             result = result.to(dtype=in_dtype)
 
-            # --- Reshape output back ---
             if tensor_layout == "HND":
                 if not skip_output_reshape:
                     result = result.transpose(1, 2).reshape(b, l, heads * dim_head)
@@ -157,14 +154,12 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
                 else:
                     result = result.reshape(b, l, heads * dim_head)
 
-            # Periodic progress log
             if sage_ok_count % 100 == 0:
                 logger.info(
                     f"[SageAttention] progress: {sage_ok_count} OK, "
                     f"{fallback_mask_count} mask, {fallback_err_count} err, "
                     f"total: {call_count}"
                 )
-
             return result
 
         except Exception as e:
@@ -172,6 +167,12 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
             if fallback_err_count <= 3:
                 logger.warning(
                     f"[SageAttention] kernel FAILED #{fallback_err_count}: {e}"
+                )
+            if fallback_err_count >= _max_fails:
+                _kernel_broken = True
+                logger.info(
+                    f"[SageAttention] SELF-DISABLED after {_max_fails} failures. "
+                    f"Falling back to attention_pytorch."
                 )
             return _fallback(q_orig, k_orig, v_orig, heads, mask=mask,
                              skip_reshape=skip_reshape,

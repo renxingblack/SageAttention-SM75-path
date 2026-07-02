@@ -1,38 +1,32 @@
 """
 ComfyUI Custom Node: SageAttention SM75 for NVIDIA T4 (Turing)
 
-Monkey-patches torch.nn.functional.scaled_dot_product_attention globally
-to route through SageAttention's INT8 kernel.
+Patches attention via ComfyUI's optimized_attention_override mechanism
+(model.model_options["transformer_options"]["optimized_attention_override"]),
+which intercepts attention at the wrap_attn decorator level — the CORRECT
+approach for LTX models (they use transformer_options dispatch).
 
-Patches globally (like the original LTX SageAttention script) because
-model.add_object_patch with "torch.nn.functional..." key fails on LTX
-models: resolve_attr tries getattr(LTXAV, "torch") which doesn't exist.
-
-Uses reference counting so multiple nodes in one workflow play nice.
+Built-in ComfyUI reference: comfy/ldm/modules/attention.py :: attention_sage()
+Same reshape/mask/dtype logic, but routes to SageAttention-SM75 CUDA kernel.
 
 Requires:
-  - SageAttention-SM75 built and installed
-  - NVIDIA T4 (SM75) or compatible GPU
+  - SageAttention-SM75 built and installed (pip install -e .)
+  - NVIDIA T4 (SM75) or compatible Turing GPU
 """
 
-import sys
 import torch
-import torch.nn.functional as F
 import logging
 
 logger = logging.getLogger("SageAttention")
 
-# Cache: only import sageattn once
+# Cache for SageAttention import
 _sageattn_fn = None
 _sageattn_available = False
 _sageattn_checked = False
 
-# Keep a reference to the TRUE original sdpa before any patches
-_TRUE_ORIGINAL_SDPA = F.scaled_dot_product_attention
-
 
 def _check_sageattn():
-    """Lazy import sageattn. Returns (callable or None, available_bool)."""
+    """Lazy import sageattn (top-level dispatch, auto-detects GPU arch)."""
     global _sageattn_fn, _sageattn_available, _sageattn_checked
     if _sageattn_checked:
         return _sageattn_fn, _sageattn_available
@@ -45,125 +39,171 @@ def _check_sageattn():
     except ImportError:
         _sageattn_fn = None
         _sageattn_available = False
-        logger.warning("SageAttention not installed")
+        logger.warning("SageAttention not installed — node will passthrough")
     return _sageattn_fn, _sageattn_available
 
 
-def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
+def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
     """
-    Creates a replacement for F.scaled_dot_product_attention that
-    dispatches to SageAttention. Falls back to TRUE original sdpa on unsupported cases.
+    Creates an attention function matching ComfyUI's wrap_attn convention.
+
+    The returned function has the same signature as the built-in
+    attention_sage() — (q, k, v, heads, mask, attn_precision, ...) — and
+    is called via transformer_options["optimized_attention_override"].
+
+    Key design (matches ComfyUI attention_sage exactly):
+      - FP32 → FP16 auto-conversion (LTX runs attention in float32)
+      - skip_reshape: q=[B,L,H*D] → NHD / q=[B,H,L,D] → HND
+      - mask → fallback to attention_pytorch (SageAttention SM75 doesn't support masks)
+      - Exception → fallback to attention_pytorch
     """
     sageattn_fn, available = _check_sageattn()
     if not available:
-        raise RuntimeError("SageAttention not installed.")
+        raise RuntimeError("SageAttention not installed")
 
-    # Use the true original sdpa (captured at module load time), not whatever
-    # F.scaled_dot_product_attention currently points to (may be another patch).
-    _original = _TRUE_ORIGINAL_SDPA
+    # Counters (reset per node execution — acceptable)
+    call_count = 0
+    sage_ok_count = 0
+    fallback_mask_count = 0
+    fallback_err_count = 0
+    logged_shapes = set()
 
-    _call_count = 0
-    _sage_count = 0
-    _fallback_count = 0
-    _logged_shapes = set()
+    def attention_sage_t4(q, k, v, heads, mask=None, attn_precision=None,
+                          skip_reshape=False, skip_output_reshape=False, **kwargs):
+        """
+        SageAttention SM75 override for ComfyUI optimized_attention.
 
-    def patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
-                     is_causal=False, scale=None, enable_gqa=False):
-        nonlocal _call_count, _sage_count, _fallback_count
-        _call_count += 1
+        Call chain:
+          wrap_attn → override(func, q, k, v, heads, ...) → attention_sage_t4(q, k, v, heads, ...)
+        """
+        nonlocal call_count, sage_ok_count, fallback_mask_count, fallback_err_count
+        call_count += 1
 
-        # Log first 5 unique shapes with dtype info
-        shape_key = f"{query.shape}_{query.dtype}"
-        if shape_key not in _logged_shapes and len(_logged_shapes) < 5:
-            _logged_shapes.add(shape_key)
+        # --- Diagnostic: log first 3 unique shapes ---
+        shape_key = f"{tuple(q.shape)}_{q.dtype}"
+        if shape_key not in logged_shapes and len(logged_shapes) < 3:
+            logged_shapes.add(shape_key)
             logger.info(
-                f"[SageAttention] sdpa #{_call_count}: "
-                f"shape={tuple(query.shape)}, dtype={query.dtype}, "
-                f"mask={attn_mask is not None}, dropout={dropout_p}, "
-                f"causal={is_causal}, scale={scale}"
+                f"[SageAttention] call #{call_count}: "
+                f"q.shape={tuple(q.shape)}, dtype={q.dtype}, "
+                f"heads={heads}, mask={mask is not None}, "
+                f"skip_reshape={skip_reshape}"
             )
 
-        # Fallback: custom attention mask (не поддерживается SageAttention)
-        if attn_mask is not None:
-            _fallback_count += 1
-            if _fallback_count == 1:
-                logger.info(f"[SageAttention] fallback #{_fallback_count}: attn_mask present")
-            return _original(query, key, value, attn_mask=attn_mask,
-                             dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+        # --- Fallback: mask (SageAttention SM75 не поддерживает кастомные маски) ---
+        if mask is not None:
+            fallback_mask_count += 1
+            if fallback_mask_count <= 3:
+                logger.info(
+                    f"[SageAttention] mask fallback #{fallback_mask_count}: "
+                    f"mask.shape={tuple(mask.shape)}, dtype={mask.dtype}"
+                )
+            return _fallback(q, k, v, heads, mask=mask,
+                             skip_reshape=skip_reshape,
+                             skip_output_reshape=skip_output_reshape,
+                             attn_precision=attn_precision, **kwargs)
 
-        # Fallback: dropout
-        if dropout_p > 0.0:
-            _fallback_count += 1
-            if _fallback_count == 1:
-                logger.info(f"[SageAttention] fallback #{_fallback_count}: dropout={dropout_p}")
-            return _original(query, key, value, attn_mask=attn_mask,
-                             dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+        # --- Save original dtype for output conversion ---
+        in_dtype = v.dtype
 
-        # Auto-convert FP32 → FP16 для SageAttention INT8 kernel
-        # (LTX модели часто работают в float32, но INT8 тензорные ядра T4
-        #  дают огромное ускорение даже с конвертацией туда-обратно)
-        need_convert_back = query.dtype == torch.float32
-        if need_convert_back:
-            q = query.half()
-            k = key.half()
-            v = value.half()
+        # --- FP32 → FP16 (SageAttention SM75 требует FP16) ---
+        if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
+            q_h = q.half()
+            k_h = k.half()
+            v_h = v.half()
         else:
-            q = query
-            k = key
-            v = value
+            q_h, k_h, v_h = q, k, v
 
-        # Detect layout: HND [B,H,L,D] vs NHD [B,L,H,D]
-        if q.shape[1] < q.shape[2]:
+        # --- Reshape to SageAttention layout ---
+        if skip_reshape:
+            # Input: [B, H, L, D] — heads already split (HND layout)
+            b, h, l, dim_head = q_h.shape
             tensor_layout = "HND"
         else:
+            # Input: [B, L, H*D] — need to split heads
+            b, l, dim_head = q_h.shape
+            dim_head //= heads
+            q_h = q_h.view(b, l, heads, dim_head)
+            k_h = k_h.view(b, l, heads, dim_head)
+            v_h = v_h.view(b, l, heads, dim_head)
             tensor_layout = "NHD"
 
+        # --- Call SageAttention ---
         try:
-            _sage_count += 1
             result = sageattn_fn(
-                q.contiguous(), k.contiguous(), v.contiguous(),
+                q_h.contiguous(), k_h.contiguous(), v_h.contiguous(),
                 tensor_layout=tensor_layout,
-                is_causal=is_causal,
-                sm_scale=scale,
-                return_lse=False,
+                is_causal=False,
                 smooth_k=smooth_k,
                 qk_quant_gran=qk_quant_gran,
             )
-            # Convert back to original dtype if needed
-            if need_convert_back:
-                result = result.to(dtype=torch.float32)
+            sage_ok_count += 1
 
-            # Log summary every 100 successful calls
-            if _sage_count % 100 == 0:
+            # Convert back to original dtype (crucial for FP32 models)
+            result = result.to(dtype=in_dtype)
+
+            # --- Reshape output back ---
+            if tensor_layout == "HND":
+                if not skip_output_reshape:
+                    result = result.transpose(1, 2).reshape(b, l, heads * dim_head)
+            else:
+                if skip_output_reshape:
+                    result = result.transpose(1, 2)
+                else:
+                    result = result.reshape(b, l, heads * dim_head)
+
+            # Periodic progress log
+            if sage_ok_count % 100 == 0:
                 logger.info(
-                    f"[SageAttention] progress: {_sage_count} kernel calls, "
-                    f"{_fallback_count} fallbacks, total sdpa calls: {_call_count}"
+                    f"[SageAttention] progress: {sage_ok_count} OK, "
+                    f"{fallback_mask_count} mask, {fallback_err_count} err, "
+                    f"total: {call_count}"
                 )
+
             return result
+
         except Exception as e:
-            _fallback_count += 1
-            if _fallback_count <= 3:
-                logger.warning(f"[SageAttention] kernel failed: {e}")
-            return _original(query, key, value, attn_mask=attn_mask,
-                             dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+            fallback_err_count += 1
+            if fallback_err_count <= 3:
+                logger.warning(
+                    f"[SageAttention] kernel FAILED #{fallback_err_count}: {e}"
+                )
+            return _fallback(q, k, v, heads, mask=mask,
+                             skip_reshape=skip_reshape,
+                             skip_output_reshape=skip_output_reshape,
+                             attn_precision=attn_precision, **kwargs)
 
-    return patched_sdpa
+    def _fallback(q, k, v, heads, mask=None,
+                  skip_reshape=False, skip_output_reshape=False,
+                  attn_precision=None, **kwargs):
+        """Fallback to ComfyUI's attention_pytorch (standard SDPA)."""
+        from comfy.ldm.modules.attention import attention_pytorch
+        return attention_pytorch(
+            q, k, v, heads, mask=mask,
+            attn_precision=attn_precision,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape,
+            **kwargs
+        )
 
+    return attention_sage_t4
+
+
+# ---------------------------------------------------------------------------
+# ComfyUI Node: SageAttentionT4_Apply
+# ---------------------------------------------------------------------------
 
 class SageAttentionNode:
     """
-    Applies SageAttention INT8 attention to a MODEL.
+    Applies SageAttention INT8 attention to a MODEL via
+    transformer_options["optimized_attention_override"].
 
-    Uses model.add_object_patch to redirect sdpa -> SageAttention.
-    The patch only affects this model instance (not global).
+    This is the CORRECT mechanism for LTX models: ComfyUI's wrap_attn()
+    decorator checks transformer_options for a registered override and
+    calls it instead of the default attention function.
 
-    Inputs:
-      model    - The model to patch (MODEL)
-      smooth_k - Subtract K-mean before attention (default: True, recommended)
-      enable   - Enable/disable patch (default: True)
-
-    Outputs:
-      model    - Patched model (MODEL)
+    Usage: place BEFORE the KSampler in the workflow.
+    Supports: LTX Video, SD1.5, SDXL, Flux (any model using wrap_attn dispatch).
     """
 
     @classmethod
@@ -173,8 +213,8 @@ class SageAttentionNode:
                 "model": ("MODEL",),
                 "smooth_k": ("BOOLEAN", {
                     "default": True,
-                    "label_on": "smooth_k on (recommended)",
-                    "label_off": "smooth_k off",
+                    "label_on": "smooth_k ON (recommended)",
+                    "label_off": "smooth_k OFF",
                 }),
                 "enable": ("BOOLEAN", {
                     "default": True,
@@ -188,69 +228,53 @@ class SageAttentionNode:
     RETURN_NAMES = ("model",)
     FUNCTION = "apply_patch"
     CATEGORY = "SageAttention-T4"
-    DESCRIPTION = "⚡ 2× attention on T4 via INT8 tensor cores. Safe: auto-fallback for masks/non-FP16."
+    DESCRIPTION = "2× attention on T4 via INT8 tensor cores. Safe auto-fallback."
 
     def apply_patch(self, model, smooth_k=True, enable=True):
         if not enable:
-            logger.debug("Passthrough (enable=False)")
+            logger.debug("SageAttention: passthrough (enable=False)")
             return (model,)
 
         _, available = _check_sageattn()
         if not available:
-            logger.warning("SageAttention NOT installed — passthrough")
+            logger.warning("SageAttention not installed — passthrough")
             return (model,)
 
-        # Create the patched sdpa function
-        patched_fn = _create_patched_sdpa(
+        # Create the attention function
+        attn_func = _create_sage_attn_func(
             smooth_k=smooth_k,
             qk_quant_gran="per_warp"
         )
 
-        # Global monkey-patch of F.scaled_dot_product_attention
-        # (add_object_patch with "torch.nn.functional..." key doesn't work
-        #  on LTXAV models — resolve_attr fails on getattr(model, "torch"))
-        #
-        # Patch at MULTIPLE levels to catch modules that may have done
-        #   from torch.nn.functional import scaled_dot_product_attention
-        # at import time (which creates a local reference bypassing F. patch).
-        #
-        # Use reference counting to support multiple nodes stacking safely.
-        if not hasattr(F, '_sageattn_prev_sdpa'):
-            F._sageattn_prev_sdpa = F.scaled_dot_product_attention
-            F._sageattn_refcount = 0
-            # Also save torch.nn.functional level
-            torch._sageattn_nn_func_prev = torch.nn.functional.scaled_dot_product_attention
+        # Apply via ComfyUI's optimized_attention_override
+        # wrap_attn() checks: transformer_options["optimized_attention_override"]
+        # and calls: override(func, q, k, v, heads, ...)
+        m = model.clone()
+        if "transformer_options" not in m.model_options:
+            m.model_options["transformer_options"] = {}
 
-        F.scaled_dot_product_attention = patched_fn
-        torch.nn.functional.scaled_dot_product_attention = patched_fn
-        F._sageattn_refcount += 1
+        # The override receives (func, *args, **kwargs) from wrap_attn.
+        # func is the original wrapped function (unused here).
+        def attention_override(func, *args, **kwargs):
+            return attn_func(*args, **kwargs)
 
-        # Also try to patch modules that may have imported sdpa directly
-        # (common Python gotcha: 'from torch.nn.functional import ...' creates local ref)
-        for _mod_name, _mod in list(sys.modules.items()):
-            try:
-                if (hasattr(_mod, 'scaled_dot_product_attention')
-                        and not _mod_name.startswith('torch.')
-                        and _mod_name != 'torch'
-                        and getattr(_mod, 'scaled_dot_product_attention', None) in (
-                            F._sageattn_prev_sdpa, torch._sageattn_nn_func_prev)):
-                    _mod.scaled_dot_product_attention = patched_fn
-            except Exception:
-                pass
+        m.model_options["transformer_options"][
+            "optimized_attention_override"
+        ] = attention_override
 
-        logger.info(f"SageAttention applied (smooth_k={smooth_k}, refcount={F._sageattn_refcount})")
-        return (model,)
+        logger.info(
+            f"SageAttention applied via optimized_attention_override "
+            f"(smooth_k={smooth_k})"
+        )
+        return (m,)
 
 
 class SageAttentionRemoveNode:
     """
-    Removes SageAttention patch from a MODEL, restoring original attention.
+    Removes SageAttention override from a MODEL, restoring original attention.
 
-    Inputs:
-      model - The model to un-patch (MODEL)
-
-    Outputs:
-      model - Clean model with original attention (MODEL)
+    Use when you need to chain SageAttention for part of a workflow
+    and fall back to standard attention for the rest.
     """
 
     @classmethod
@@ -265,33 +289,14 @@ class SageAttentionRemoveNode:
     RETURN_NAMES = ("model",)
     FUNCTION = "remove_patch"
     CATEGORY = "SageAttention-T4"
-    DESCRIPTION = "Removes SageAttention-T4 patch — restores original scaled_dot_product_attention."
+    DESCRIPTION = "Removes SageAttention override — restores original attention."
 
     def remove_patch(self, model):
-        if not hasattr(F, '_sageattn_prev_sdpa'):
-            logger.warning("No SageAttention patch to remove (never applied)")
-            return (model,)
-
-        F._sageattn_refcount -= 1
-        logger.info(f"SageAttention refcount decremented to {F._sageattn_refcount}")
-
-        if F._sageattn_refcount <= 0:
-            _prev = F._sageattn_prev_sdpa
-            F.scaled_dot_product_attention = _prev
-            torch.nn.functional.scaled_dot_product_attention = _prev
-            # Restore modules that imported sdpa directly
-            for _mod_name, _mod in list(sys.modules.items()):
-                try:
-                    if (hasattr(_mod, 'scaled_dot_product_attention')
-                            and not _mod_name.startswith('torch.')
-                            and _mod_name != 'torch'):
-                        _mod.scaled_dot_product_attention = _prev
-                except Exception:
-                    pass
-            del F._sageattn_prev_sdpa
-            del F._sageattn_refcount
-            logger.info("SageAttention patch fully removed (last reference)")
+        m = model.clone()
+        topts = m.model_options.get("transformer_options")
+        if topts and "optimized_attention_override" in topts:
+            del topts["optimized_attention_override"]
+            logger.info("SageAttention override removed")
         else:
-            logger.info("SageAttention patch kept alive (other references remain)")
-
-        return (model,)
+            logger.warning("No SageAttention override found on model")
+        return (m,)

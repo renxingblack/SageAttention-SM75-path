@@ -6,10 +6,5 @@ try:
     SM75_CUDA_ENABLED = True
 except ImportError:
     SM75_CUDA_ENABLED = False
-# Other arch kernels — not built on SM75-only, but keep for compatibility
-try:
-    from .core import sageattn_qk_int8_pv_fp8_cuda
-except ImportError:
-    pass
 
-__version__ = "2.1.1" # Or update if making a new release
+__version__ = "2.1.1"

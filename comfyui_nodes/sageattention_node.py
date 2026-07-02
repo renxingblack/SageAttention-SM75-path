@@ -15,6 +15,7 @@ Requires:
   - NVIDIA T4 (SM75) or compatible GPU
 """
 
+import sys
 import torch
 import torch.nn.functional as F
 import logging
@@ -61,21 +62,49 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
     # F.scaled_dot_product_attention currently points to (may be another patch).
     _original = _TRUE_ORIGINAL_SDPA
 
+    _call_count = 0
+    _sage_count = 0
+    _fallback_count = 0
+    _logged_shapes = set()
+
     def patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                      is_causal=False, scale=None, enable_gqa=False):
+        nonlocal _call_count, _sage_count, _fallback_count
+        _call_count += 1
+
+        # Log first 3 calls with shape/dtype info
+        shape_key = f"{query.shape}_{query.dtype}"
+        if shape_key not in _logged_shapes and len(_logged_shapes) < 5:
+            _logged_shapes.add(shape_key)
+            logger.info(
+                f"[SageAttention] sdpa #{_call_count}: "
+                f"shape={tuple(query.shape)}, dtype={query.dtype}, "
+                f"mask={attn_mask is not None}, dropout={dropout_p}, "
+                f"causal={is_causal}, scale={scale}"
+            )
+
         # Fallback: custom attention mask
         if attn_mask is not None:
+            _fallback_count += 1
+            if _fallback_count == 1:
+                logger.info(f"[SageAttention] fallback #{_fallback_count}: attn_mask present")
             return _original(query, key, value, attn_mask=attn_mask,
                              dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
         # Fallback: dropout (not supported in INT8 path)
         if dropout_p > 0.0:
+            _fallback_count += 1
+            if _fallback_count == 1:
+                logger.info(f"[SageAttention] fallback #{_fallback_count}: dropout={dropout_p}")
             return _original(query, key, value, attn_mask=attn_mask,
                              dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
         # Fallback: non-FP16/BF16 tensor dtypes
         dtype = query.dtype
         if dtype not in (torch.float16, torch.bfloat16):
+            _fallback_count += 1
+            if _fallback_count == 1:
+                logger.info(f"[SageAttention] fallback #{_fallback_count}: dtype={dtype}")
             return _original(query, key, value, attn_mask=attn_mask,
                              dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
@@ -87,7 +116,8 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
             tensor_layout = "NHD"
 
         try:
-            return sageattn_fn(
+            _sage_count += 1
+            result = sageattn_fn(
                 query.contiguous(), key.contiguous(), value.contiguous(),
                 tensor_layout=tensor_layout,
                 is_causal=is_causal,
@@ -96,8 +126,17 @@ def _create_patched_sdpa(smooth_k=True, qk_quant_gran="per_warp"):
                 smooth_k=smooth_k,
                 qk_quant_gran=qk_quant_gran,
             )
+            # Log summary every 100 successful calls
+            if _sage_count % 100 == 0:
+                logger.info(
+                    f"[SageAttention] progress: {_sage_count} kernel calls, "
+                    f"{_fallback_count} fallbacks, total sdpa calls: {_call_count}"
+                )
+            return result
         except Exception as e:
-            logger.debug(f"SageAttention failed, falling back to sdpa: {e}")
+            _fallback_count += 1
+            if _fallback_count <= 3:
+                logger.warning(f"[SageAttention] kernel failed: {e}")
             return _original(query, key, value, attn_mask=attn_mask,
                              dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
@@ -164,13 +203,33 @@ class SageAttentionNode:
         # (add_object_patch with "torch.nn.functional..." key doesn't work
         #  on LTXAV models — resolve_attr fails on getattr(model, "torch"))
         #
+        # Patch at MULTIPLE levels to catch modules that may have done
+        #   from torch.nn.functional import scaled_dot_product_attention
+        # at import time (which creates a local reference bypassing F. patch).
+        #
         # Use reference counting to support multiple nodes stacking safely.
         if not hasattr(F, '_sageattn_prev_sdpa'):
             F._sageattn_prev_sdpa = F.scaled_dot_product_attention
             F._sageattn_refcount = 0
+            # Also save torch.nn.functional level
+            torch._sageattn_nn_func_prev = torch.nn.functional.scaled_dot_product_attention
 
         F.scaled_dot_product_attention = patched_fn
+        torch.nn.functional.scaled_dot_product_attention = patched_fn
         F._sageattn_refcount += 1
+
+        # Also try to patch modules that may have imported sdpa directly
+        # (common Python gotcha: 'from torch.nn.functional import ...' creates local ref)
+        for _mod_name, _mod in list(sys.modules.items()):
+            try:
+                if (hasattr(_mod, 'scaled_dot_product_attention')
+                        and not _mod_name.startswith('torch.')
+                        and _mod_name != 'torch'
+                        and getattr(_mod, 'scaled_dot_product_attention', None) in (
+                            F._sageattn_prev_sdpa, torch._sageattn_nn_func_prev)):
+                    _mod.scaled_dot_product_attention = patched_fn
+            except Exception:
+                pass
 
         logger.info(f"SageAttention applied (smooth_k={smooth_k}, refcount={F._sageattn_refcount})")
         return (model,)
@@ -210,7 +269,18 @@ class SageAttentionRemoveNode:
         logger.info(f"SageAttention refcount decremented to {F._sageattn_refcount}")
 
         if F._sageattn_refcount <= 0:
-            F.scaled_dot_product_attention = F._sageattn_prev_sdpa
+            _prev = F._sageattn_prev_sdpa
+            F.scaled_dot_product_attention = _prev
+            torch.nn.functional.scaled_dot_product_attention = _prev
+            # Restore modules that imported sdpa directly
+            for _mod_name, _mod in list(sys.modules.items()):
+                try:
+                    if (hasattr(_mod, 'scaled_dot_product_attention')
+                            and not _mod_name.startswith('torch.')
+                            and _mod_name != 'torch'):
+                        _mod.scaled_dot_product_attention = _prev
+                except Exception:
+                    pass
             del F._sageattn_prev_sdpa
             del F._sageattn_refcount
             logger.info("SageAttention patch fully removed (last reference)")

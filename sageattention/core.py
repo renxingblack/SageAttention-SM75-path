@@ -587,6 +587,18 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     else:
          raise ValueError(f"Invalid qk_quant_gran: {qk_quant_gran}")
 
+    if qk_quant_gran == "per_warp":
+        expected_k_scale_blocks = (k_to_quant.shape[1 if tensor_layout == "NHD" else 2] + blkk_quant - 1) // blkk_quant
+        expected_k_scale_warps = expected_k_scale_blocks * (blkk_quant // warpk_quant)
+        if k_scale.shape[-1] == expected_k_scale_blocks:
+            k_scale = k_scale.repeat_interleave(blkk_quant // warpk_quant, dim=-1)
+        elif k_scale.shape[-1] != expected_k_scale_warps:
+            raise RuntimeError(
+                "SM75 key_scale shape mismatch before kernel launch: "
+                f"got {tuple(k_scale.shape)}, expected last dim {expected_k_scale_warps} "
+                f"for k shape {tuple(k_to_quant.shape)}, BLKK={blkk_quant}, WARPK={warpk_quant}"
+            )
+
     # Output tensor (always FP16 for this kernel)
     o = torch.empty(q.shape, dtype=torch.float16, device=q.device)
 

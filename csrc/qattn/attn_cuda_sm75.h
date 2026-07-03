@@ -309,10 +309,15 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
                 }
 
                 // Online softmax update
+                // With INT8 MMA groupOf=4 layout, 4 threads cover one Q row.
+                // shfl_xor {1,2} reduces within the group-of-4 (same Q row),
+                // giving each thread the max/sum for its Q row only.
+                // This is correct because softmax is row-wise.
+                // Previous {8,16} incorrectly mixed across Q rows.
                 float m_local = fmaxf(s0, s1);
                 m_local *= sm_scale;
-                m_local = fmaxf(m_local, __shfl_xor_sync(0xffffffff, m_local, 8));
-                m_local = fmaxf(m_local, __shfl_xor_sync(0xffffffff, m_local, 16));
+                m_local = fmaxf(m_local, __shfl_xor_sync(0xffffffff, m_local, 1));
+                m_local = fmaxf(m_local, __shfl_xor_sync(0xffffffff, m_local, 2));
 
                 float m_prev = m_i[mq];
                 float m_new = fmaxf(m_prev, m_local);
@@ -328,10 +333,12 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
                 if (s0 <= -1e29f) p0 = 0.0f;
                 if (s1 <= -1e29f) p1 = 0.0f;
 
-                // Accumulate denominator
+                // Accumulate denominator (row-wise reduction, groupOf=4)
+                // shfl_xor {1,2} sums within the 4-thread Q-row group.
+                // Previous {8,16} incorrectly mixed across Q rows.
                 float l_local = p0 + p1;
-                l_local += __shfl_xor_sync(0xffffffff, l_local, 8);
-                l_local += __shfl_xor_sync(0xffffffff, l_local, 16);
+                l_local += __shfl_xor_sync(0xffffffff, l_local, 1);
+                l_local += __shfl_xor_sync(0xffffffff, l_local, 2);
                 l_i[mq] += l_local;
 
                 // Write P to shared memory: 16×8 layout, row-major, stride=8
@@ -350,19 +357,30 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
 
             // CRITICAL FIX: Renormalize RO AFTER computing both mq but BEFORE PV MMA
             // This ensures: O_new = exp(m_old - m_new) * O_old + P @ V
-            #pragma unroll
-            for(int mq = 0; mq < NUM_M_TILES_QK; ++mq) {
-                float o_scale = math::ptx_exp2(m_old[mq] - m_i[mq]);
-                // Per-thread-group renormalization
-                // Threads 0-15 handle mq=0 (rows 0-7), threads 16-31 handle mq=1 (rows 8-15)
-                if ((mq == 0 && lane_id < 16) || (mq == 1 && lane_id >= 16)) {
-                    #pragma unroll
-                    for(int fk = 0; fk < NUM_N_V_TILES; ++fk) {
-                        RO_accum[fk * 4 + 0] *= o_scale;
-                        RO_accum[fk * 4 + 1] *= o_scale;
-                        RO_accum[fk * 4 + 2] *= o_scale;
-                        RO_accum[fk * 4 + 3] *= o_scale;
-                    }
+            // Each thread writes 2 output rows (2*(lane_id/4) and 2*(lane_id/4)+1).
+            // Use __shfl_sync to fetch m_old/m_i from the lane that computed
+            // the matching Q row (groupOf=4: src_lane = (row % 8) * 4).
+            {
+                uint32_t thread_row0 = (lane_id / 4) * 2;
+                uint32_t thread_row1 = thread_row0 + 1;
+
+                uint32_t src_lane0 = (thread_row0 % 8) * 4;
+                uint32_t src_lane1 = (thread_row1 % 8) * 4;
+
+                float m_old_0 = (thread_row0 < 8) ? __shfl_sync(0xffffffff, m_old[0], src_lane0) : __shfl_sync(0xffffffff, m_old[1], src_lane0);
+                float m_i_0   = (thread_row0 < 8) ? __shfl_sync(0xffffffff, m_i[0],   src_lane0) : __shfl_sync(0xffffffff, m_i[1],   src_lane0);
+                float m_old_1 = (thread_row1 < 8) ? __shfl_sync(0xffffffff, m_old[0], src_lane1) : __shfl_sync(0xffffffff, m_old[1], src_lane1);
+                float m_i_1   = (thread_row1 < 8) ? __shfl_sync(0xffffffff, m_i[0],   src_lane1) : __shfl_sync(0xffffffff, m_i[1],   src_lane1);
+
+                float o_scale_0 = math::ptx_exp2(m_old_0 - m_i_0);
+                float o_scale_1 = math::ptx_exp2(m_old_1 - m_i_1);
+
+                #pragma unroll
+                for(int fk = 0; fk < NUM_N_V_TILES; ++fk) {
+                    RO_accum[fk * 4 + 0] *= o_scale_0;
+                    RO_accum[fk * 4 + 1] *= o_scale_0;
+                    RO_accum[fk * 4 + 2] *= o_scale_1;
+                    RO_accum[fk * 4 + 3] *= o_scale_1;
                 }
             }
 
@@ -405,17 +423,29 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
     } // End K tile loop
 
     // --- Final Normalization ---
-    // Per-thread-group: threads 0-15 (rows 0-7) normalized by l_i[0],
-    // threads 16-31 (rows 8-15) normalized by l_i[1].
-    float l_rcp_0 = (l_i[0] > 0.0f) ? math::ptx_rcp(l_i[0]) : 0.0f;
-    float l_rcp_1 = (l_i[1] > 0.0f) ? math::ptx_rcp(l_i[1]) : 0.0f;
-    float l_rcp = (lane_id < 16) ? l_rcp_0 : l_rcp_1;
-    #pragma unroll
-    for(int fk = 0; fk < NUM_N_V_TILES; ++fk) {
-        RO_accum[fk * 4 + 0] *= l_rcp;
-        RO_accum[fk * 4 + 1] *= l_rcp;
-        RO_accum[fk * 4 + 2] *= l_rcp;
-        RO_accum[fk * 4 + 3] *= l_rcp;
+    // Each thread writes 2 output rows (2*(lane_id/4) and 2*(lane_id/4)+1).
+    // Use __shfl_sync to fetch l_i from the lane group that computed
+    // the matching Q row. src_lane = (row % 8) * 4 (groupOf=4 layout).
+    {
+        uint32_t thread_row0 = (lane_id / 4) * 2;
+        uint32_t thread_row1 = thread_row0 + 1;
+
+        uint32_t src_lane0 = (thread_row0 % 8) * 4;
+        float l_i_0 = (thread_row0 < 8) ? __shfl_sync(0xffffffff, l_i[0], src_lane0) : __shfl_sync(0xffffffff, l_i[1], src_lane0);
+
+        uint32_t src_lane1 = (thread_row1 % 8) * 4;
+        float l_i_1 = (thread_row1 < 8) ? __shfl_sync(0xffffffff, l_i[0], src_lane1) : __shfl_sync(0xffffffff, l_i[1], src_lane1);
+
+        float l_rcp_0 = (l_i_0 > 0.0f) ? math::ptx_rcp(l_i_0) : 0.0f;
+        float l_rcp_1 = (l_i_1 > 0.0f) ? math::ptx_rcp(l_i_1) : 0.0f;
+
+        #pragma unroll
+        for(int fk = 0; fk < NUM_N_V_TILES; ++fk) {
+            RO_accum[fk * 4 + 0] *= l_rcp_0;
+            RO_accum[fk * 4 + 1] *= l_rcp_0;
+            RO_accum[fk * 4 + 2] *= l_rcp_1;
+            RO_accum[fk * 4 + 3] *= l_rcp_1;
+        }
     }
 
     // --- Output ---
@@ -484,9 +514,10 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
     if constexpr (return_lse) {
          #pragma unroll
          for (int mq = 0; mq < NUM_M_TILES_QK; ++mq) {
-            if (lane_id < 8) {
+            // One thread per Q-row group (groupOf=4): lanes 0, 4, 8, 12, 16, 20, 24, 28
+            if (lane_id % 4 == 0) {
                 float lse_val = (l_i[mq] > 0.f) ? (math::ptx_log2(l_i[mq]) + m_i[mq]) / math::log2e : -1e30f;
-                uint32_t lse_row_global = q_start_row_block + o_start_row_warp + mq * MMA_QK_M_SM75 + lane_id;
+                uint32_t lse_row_global = q_start_row_block + o_start_row_warp + mq * MMA_QK_M_SM75 + (lane_id / 4);
                 if (lse_row_global < qo_len) {
                     uint32_t lse_offset = batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_row_global;
                     Lse[lse_offset] = lse_val;

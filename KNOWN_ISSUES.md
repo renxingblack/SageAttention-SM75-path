@@ -1,5 +1,43 @@
 # 🐛 Known Issues
 
+## ✅ FIXED: Per-row normalization — PV output / LSE row mapping mismatch (2026-07-03)
+
+**Status:** 🟢 FIXED (ждёт пересборки и тестирования)
+
+**Root cause:** С INT8 MMA groupOf=4 лейаутом, каждый поток (lane) имеет `m_i`/`l_i` для своей Q-строки (`lane_id/4`). Но PV MMA output маппит каждый поток на **2** выходные строки: `2*(lane_id/4)` и `2*(lane_id/4)+1`. Старая нормализация использовала ОДИН `l_rcp` (от Q-строки `lane_id/4`) для обеих строк → строка `2*(lane_id/4)+1` нормализовалась чужим знаменателем.
+
+**Fix (3 changes in `attn_cuda_sm75.h`):**
+
+| Секция | Было | Стало |
+|---|---|---|
+| **Ренормализация** (в K-loop) | Один `o_scale` для всех 4 RO-аккумуляторов | `__shfl_sync` достаёт `m_old`/`m_i` для каждой из 2 выходных строк → `o_scale_0`/`o_scale_1` |
+| **Финальная норма** | Один `l_rcp = (lane_id < 16) ? 1/l_i[0] : 1/l_i[1]` | `__shfl_sync` достаёт `l_i` для каждой строки → `l_rcp_0`/`l_rcp_1` |
+| **LSE** | `lane_id < 8` + `lane_id` для row offset | `lane_id % 4 == 0` + `lane_id / 4` (один поток на Q-строку) |
+
+**Ключевая формула:** `src_lane = (row % 8) * 4` — маппит выходную строку на первый поток её groupOf=4 группы.
+
+**Файл:** `csrc/qattn/attn_cuda_sm75.h`
+
+**Требуется пересборка:** `python setup.py build_ext --inplace`
+
+---
+
+## ✅ FIXED: `shfl_xor` reduction distances `{8,16}` → `{1,2}` — warp-level softmax (2026-07-03)
+
+**Status:** 🟢 FIXED (ждёт пересборки и тестирования)
+
+**Root cause:** Онлайн-softmax использовал `__shfl_xor_sync` с дистанциями `{8, 16}` для warp-level редукции `m_local` (max) и `l_local` (sum). При groupOf=4 лейауте INT8 MMA, 4 потока обрабатывают одну Q-строку. Дистанции `{8, 16}` смешивали данные **между разными Q-строками** без редукции внутри строки → каждый поток в группе получал разное `m_local`/`l_local` → некорректный softmax → шум.
+
+**Fix:** Заменено на `{1, 2}` — butterfly reduction внутри группы из 4 потоков (одна Q-строка). Все 4 потока получают идентичный max/sum для своей строки. Разные Q-строки получают разные значения — корректно для row-wise softmax.
+
+**Почему `{1,2}` а не `{1,2,4,8,16}`:** Полная warp редукция дала бы всем 32 потокам одинаковый max/sum → per-sub-tile softmax вместо per-row → математически некорректно для attention (каждая Q-строка нормализуется своим знаменателем).
+
+**Файл:** `csrc/qattn/attn_cuda_sm75.h`
+
+**Требуется пересборка:** `python setup.py build_ext --inplace`
+
+---
+
 ## ✅ FIXED: Missing `.satfinite` in INT8 MMA PTX instruction — **TRUE ROOT CAUSE OF NOISE** (2026-07-03)
 
 **Status:** 🟢 FIXED (ждёт пересборки и тестирования)
@@ -91,122 +129,6 @@ softmax `global_q_idx` и P-store row offset с `lane_id % 8` на `lane_id / 4`
 **Fixes:**
 1. `csrc/qattn/attn_cuda_sm75.h` — добавлены static_assert для Q_GRAN/K_GRAN, добавлены per_thread ветки индексации q_scale и k_scale
 2. `sageattention/core.py` — добавлен guard для q_scale в per_thread пути: тримминг `q_scale[..., :expected_q_scales].contiguous()`
-
----
-
-## ❌ CRITICAL: Tensor query_scale must be contiguous (2026-07-03) — OLD, superseded by shape bug
-
-**Status:** 🟡 PENDING VERIFICATION (shape fix may resolve this too)
-
-**Severity:** CRITICAL — Kernel полностью не работает в real-world inference
-
-### 📋 Description
-
-SM75 kernel падает с ошибкой при первом вызове в реальном inference:
-
-```
-[WARNING] [SageAttention] kernel FAILED #1: Tensor query_scale must be contiguous
-[INFO] [SageAttention] SELF-DISABLED after 3 failures. Falling back to attention_pytorch.
-```
-
-### 🔍 Root Cause Analysis
-
-**Проблемные места:**
-
-1. **`sageattention/core.py:611`** — Slicing операция создаёт non-contiguous view:
-   ```python
-   q_scale = q_scale[..., :expected_q_scales].contiguous()  # Фикс применён, но не помог
-   ```
-
-2. **`sageattention/core.py:595`** — repeat_interleave может создать non-contiguous:
-   ```python
-   k_scale = k_scale.repeat_interleave(...).contiguous()  # Фикс применён, но не помог
-   ```
-
-3. **`sageattention/quant.py:88, 173`** — torch.empty() не гарантирует contiguous:
-   ```python
-   q_scale = torch.empty(...).contiguous()  # Фикс применён, но не помог
-   ```
-
-### 🧪 Test Cases
-
-**PASS (синтетические данные):**
-```python
-q = torch.randn(1, 128, 1, 64, dtype=torch.float16, device='cuda')
-k = torch.randn(1, 128, 1, 64, dtype=torch.float16, device='cuda')
-v = torch.randn(1, 128, 1, 64, dtype=torch.float16, device='cuda')
-O = sageattn(q, k, v, tensor_layout="NHD", is_causal=False)
-# ✅ РАБОТАЕТ
-```
-
-**FAIL (real-world inference):**
-```python
-# Вызов из inference модели:
-q.shape=(1, 5852, 4096), dtype=torch.float32  # ← FP32 вход!
-k.shape=(1, 5852, 4096), dtype=torch.float32
-v.shape=(1, 5852, 4096), dtype=torch.float32
-# ❌ ПАДАЕТ: Tensor query_scale must be contiguous
-```
-
-### 🎯 Hypotheses (Нужно проверить)
-
-1. **FP32 → FP16 конвертация** нарушает contiguous layout?
-2. **Большие размеры** (5852 seq_len) триггерят edge case в padding/slicing?
-3. **Квантизация CUDA kernels** (`_fused.quant_per_warp_int8_cuda`) возвращают non-contiguous?
-4. **Промежуточные операции** между quantization и kernel call теряют contiguous?
-
-### 🛠️ Applied Fixes (Не сработали)
-
-| Commit | File | Change | Result |
-|--------|------|--------|--------|
-| `252a777` | `quant.py:88,173` | `.contiguous()` после `torch.empty()` | ❌ FAIL |
-| `760639b` | `core.py:611,595` | `.contiguous()` после slicing/repeat_interleave | ❌ FAIL |
-
-### 🔬 Next Steps
-
-1. **Добавить debug logging** в `core.py` перед вызовом kernel:
-   ```python
-   print(f"DEBUG q_scale: contiguous={q_scale.is_contiguous()}, shape={q_scale.shape}, stride={q_scale.stride()}")
-   print(f"DEBUG k_scale: contiguous={k_scale.is_contiguous()}, shape={k_scale.shape}, stride={k_scale.stride()}")
-   ```
-
-2. **Проверить CUDA kernel outputs** в `quant.py`:
-   ```python
-   # После _fused.quant_per_warp_int8_cuda():
-   assert q_scale.is_contiguous(), f"q_scale non-contiguous after quant: {q_scale.stride()}"
-   ```
-
-3. **Тест с принудительным clone**:
-   ```python
-   q_scale = q_scale.clone()  # Вместо .contiguous()
-   k_scale = k_scale.clone()
-   ```
-
-4. **Проверить CUDA binding** в `csrc/qattn/binding.cpp`:
-   - Может быть баг в pybind11 tensor wrapping?
-
-5. **Минимальный repro case** с точными параметрами из лога:
-   ```python
-   q = torch.randn(1, 5852, 32, 128, dtype=torch.float32, device='cuda')  # Восстановить точную форму
-   # ... и шаг за шагом до kernel call
-   ```
-
-### 📝 Reproduction Instructions
-
-**Environment:**
-- GPU: NVIDIA T4 (SM75)
-- PyTorch: 2.x
-- CUDA: 11.8+
-
-**Steps:**
-1. `git pull origin main` (получить коммиты с фиксами)
-2. `python setup.py clean --all && python setup.py build_ext --inplace`
-3. Запустить inference модель с SageAttention патчем
-4. Наблюдать ошибку на первом вызове
-
-### 🤝 Help Wanted
-
-Если у вас есть идеи или вы видели похожие проблемы с CUDA kernels — пожалуйста, откройте issue!
 
 ---
 

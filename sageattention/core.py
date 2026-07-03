@@ -573,7 +573,7 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     blkq_quant = 64
     warpq_quant = 16 # Example
     blkk_quant = 64
-    warpk_quant = 16 # Must match SM75 kernel WARP_K
+    warpk_quant = 32 # Must match SM75 kernel WARP_K
 
     if qk_quant_gran == "per_warp":
         # Assuming per_warp_int8_cuda handles the optional mean subtraction internally if km is passed

@@ -571,13 +571,13 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn_sm75(
                if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
                {
                  CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75)));
-                 // K always uses per-block granularity (WARP_K=16 != CTA_K=64)
-                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75)));
+                 // K_scale: per-warp layout (matching kernel body K_GRAN indexing)
+                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75) * (CTA_K_SM75 / WARP_K_SM75)));
                }
                else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread))
                {
                  CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75) * 8));
-                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75)));
+                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75) * (CTA_K_SM75 / WARP_K_SM75) * 4));
                }
 
               // Calculate shared memory size.

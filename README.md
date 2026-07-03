@@ -15,11 +15,13 @@
 
 ---
 
-## ⚠️ Статус: В разработке (Баг не исправлен)
+## ⚠️ Статус: В разработке (Shape fix применён, нужна пересборка и тест)
 
-> **ВАЖНО (2026-07-03):** Kernel падает с ошибкой `Tensor query_scale must be contiguous`. Проблема находится в `core.py` (строки 595, 611) — slicing операции создают non-contiguous views. Два фикса запушены (коммиты `252a777`, `760639b`), но проблема сохраняется. **Требуется дальнейшая отладка.**
+> **ВАЖНО (2026-07-03):** Исправлен критический баг `key_scale shape mismatch` в `attn_cuda_sm75.h`. CHECK_SHAPE для key_scale в функции `qk_int8_sv_f16_accum_f32_attn_sm75` ошибочно ожидал per-block форму (`div_ceil(kv_len, 64)`), а ядро и Python выдают per-warp (`div_ceil(kv_len, 64) * 4`). Приведено в соответствие с smem_o вариантом.
 > 
-> **Симптомы:**
+> **Требуется:** пересборка (`python setup.py build_ext --inplace`) и тест в ComfyUI.
+> 
+> **Симптомы (до фикса):**
 > - Kernel падает сразу при первом вызове
 > - Ошибка: `[WARNING] [SageAttention] kernel FAILED: Tensor query_scale must be contiguous`
 > - После 3 неудач автоматически отключается и падает обратно на `attention_pytorch`

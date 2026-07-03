@@ -1,8 +1,18 @@
 # 🐛 Known Issues
 
-## ❌ CRITICAL: Tensor query_scale must be contiguous (2026-07-03)
+## ✅ FIXED: key_scale shape mismatch (2026-07-03)
 
-**Status:** 🔴 NOT FIXED
+**Status:** 🟢 FIXED (commit pending)
+
+**Root cause:** CHECK_SHAPE в `qk_int8_sv_f16_accum_f32_attn_sm75` ожидал per-block форму `div_ceil(kv_len, 64)` для `key_scale`, но тело ядра и Python выдают per-warp форму `div_ceil(kv_len, 64) * 4`. smem_o вариант уже был исправлен.
+
+**Fix:** `csrc/qattn/attn_cuda_sm75.h` — изменены CHECK_SHAPE для key_scale в per_warp и per_thread ветках.
+
+---
+
+## ❌ CRITICAL: Tensor query_scale must be contiguous (2026-07-03) — OLD, superseded by shape bug
+
+**Status:** 🟡 PENDING VERIFICATION (shape fix may resolve this too)
 
 **Severity:** CRITICAL — Kernel полностью не работает в real-world inference
 

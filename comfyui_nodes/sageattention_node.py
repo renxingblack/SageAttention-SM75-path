@@ -77,7 +77,7 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
 
         Self-disable: после {_max_fails} неудач просто вызывает fallback.
         """
-        nonlocal _kernel_broken
+        nonlocal call_count, sage_ok_count, fallback_mask_count, fallback_err_count, _kernel_broken
         call_count += 1
 
         # --- Diagnostic: log first 3 unique shapes ---

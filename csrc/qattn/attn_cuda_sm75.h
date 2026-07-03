@@ -549,10 +549,10 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn_sm75(
           DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
             using DTypeOut = half;
 
-              constexpr int CTA_Q_SM75 = 64;
+              constexpr int CTA_Q_SM75 = 32;
               constexpr int CTA_K_SM75 = 64;
               constexpr int WARP_Q_SM75 = 16;
-              constexpr int WARP_K_SM75 = 32;
+              constexpr int WARP_K_SM75 = 16;
 
               constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
@@ -699,10 +699,10 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn_sm75_smem_o(
         DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
           DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
             using DTypeOut = half;
-              constexpr int CTA_Q_SM75 = 64;
+              constexpr int CTA_Q_SM75 = 32;
               constexpr int CTA_K_SM75 = 64;
               constexpr int WARP_Q_SM75 = 16;
-              constexpr int WARP_K_SM75 = 32;
+              constexpr int WARP_K_SM75 = 16;
               constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
               if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)) {

@@ -588,6 +588,7 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
          raise ValueError(f"Invalid qk_quant_gran: {qk_quant_gran}")
 
     if qk_quant_gran == "per_warp":
+        # Guard for k_scale: per-block quant may produce per-block layout
         expected_k_scale_blocks = (k_to_quant.shape[1 if tensor_layout == "NHD" else 2] + blkk_quant - 1) // blkk_quant
         expected_k_scale_warps = expected_k_scale_blocks * (blkk_quant // warpk_quant)
         if k_scale.shape[-1] == expected_k_scale_blocks:
@@ -598,6 +599,16 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
                 f"got {tuple(k_scale.shape)}, expected last dim {expected_k_scale_warps} "
                 f"for k shape {tuple(k_to_quant.shape)}, BLKK={blkk_quant}, WARPK={warpk_quant}"
             )
+
+        # Guard for q_scale: quant BLKQ (64) may differ from kernel CTA_Q (32)
+        # quant produces ceil(T/64)*4 scales, but kernel expects ceil(T/32)*2
+        # First ceil(T/32)*2 entries in q_scale map 1:1 to kernel warps
+        q_seq_len = q.shape[1 if tensor_layout == "NHD" else 2]
+        CTA_Q_SM75 = 32  # Must match attn_cuda_sm75.h
+        WARP_Q_SM75 = 16  # Must match attn_cuda_sm75.h
+        expected_q_scales = (q_seq_len + CTA_Q_SM75 - 1) // CTA_Q_SM75 * (CTA_Q_SM75 // WARP_Q_SM75)
+        if q_scale.shape[-1] != expected_q_scales:
+            q_scale = q_scale[..., :expected_q_scales]
 
     # Output tensor (always FP16 for this kernel)
     o = torch.empty(q.shape, dtype=torch.float16, device=q.device)

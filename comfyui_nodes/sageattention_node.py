@@ -32,10 +32,22 @@ def _check_sageattn():
         return _sageattn_fn, _sageattn_available
     _sageattn_checked = True
     try:
+        import sageattention
         from sageattention import sageattn
         _sageattn_fn = sageattn
         _sageattn_available = True
-        logger.info("SageAttention imported successfully")
+        cuda_info = "cuda-unavailable"
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            capability = torch.cuda.get_device_capability(device)
+            cuda_info = f"cuda={torch.version.cuda}, cc=sm{capability[0]}{capability[1]}"
+        logger.info(
+            "SageAttention imported successfully "
+            f"(pkg={getattr(sageattention, '__file__', 'unknown')}, "
+            f"version={getattr(sageattention, '__version__', 'unknown')}, "
+            f"torch={torch.__version__}, {cuda_info}, "
+            f"sm75={getattr(sageattention, 'SM75_CUDA_ENABLED', 'unknown')})"
+        )
     except ImportError:
         _sageattn_fn = None
         _sageattn_available = False

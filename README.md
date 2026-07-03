@@ -15,28 +15,13 @@
 
 ---
 
-## ⚠️ Статус: K_GRAN fix применён — запущена пересборка
+## ⚠️ Статус: ldmatrix → manual load fix — запущена пересборка
 
-> **ВАЖНО (2026-07-03):** Исправлен архитектурный баг: K_GRAN теперь всегда `kPerBlock` (как в официальном SageAttention). Раньше был ошибочно форсирован в `kPerWarp`, что требовало `repeat_interleave` костыля и вызывало шум на реальном инференсе.
-> 
-> **Изменения (3 файла):**
-> - `csrc/qattn/attn_cuda_sm75.h` — K_GRAN = `QuantGranularity::kPerBlock` в обеих host-функциях
-> - `sageattention/quant.py` — убран `repeat_interleave` для k_scale
-> - `sageattention/core.py` — упрощён guard для per-block k_scale
-> 
+> **ВАЖНО (2026-07-03):** Найдена и исправлена **настоящая причина визуального шума**: `ldmatrix_m8n8x4` несовместим с INT8 MMA на Turing. `ldmatrix` раскладывает данные в **FP16** tensor core layout, несовместимый с INT8 MMA fragment layout. Заменён на ручную `uint32_t` загрузку.
+>
+> **Дополнительно:** K_GRAN теперь всегда `kPerBlock` (как в официальном SageAttention), убран `repeat_interleave` костыль.
+>
 > **Требуется:** пересборка (`python setup.py build_ext --inplace`) и тест в ComfyUI.
-> 
-> **Симптомы (до фикса):**
-> - Kernel падает сразу при первом вызове
-> - Ошибка: `[WARNING] [SageAttention] kernel FAILED: Tensor query_scale must be contiguous`
-> - После 3 неудач автоматически отключается и падает обратно на `attention_pytorch`
-> 
-> **Текущий статус работ:**
-> - ✅ Юнит-тесты с синтетическими данными проходят
-> - ❌ Real-world инференс на T4 с FP32 входами падает
-> - 🔄 Продолжение отладки запланировано
-> 
-> **Не используйте в продакшене до исправления!**
 
 ---
 

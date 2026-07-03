@@ -260,7 +260,7 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
                 #pragma unroll
                 for(int acc_idx = 0; acc_idx < NUM_QK_ACCUM; ++acc_idx) RS_accum[acc_idx] = 0;
 
-                // SM75 INT8 MMA m8n8k16: use manual ld.shared.b32 (NOT ldmatrix!)
+                // SM75 INT8 MMA m8n8k16: manual ld.shared.b32 (NOT ldmatrix!) on Turing
                 // ldmatrix distributes data in FP16 tensor core layout, incompatible with
                 // Turing INT8 MMA fragment layout. On Turing, INT8 MMA fragments use:
                 //   row = lane_id / 4,  col_chunk = lane_id % 4  (4 int8s per chunk)

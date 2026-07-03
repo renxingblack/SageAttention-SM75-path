@@ -112,7 +112,7 @@ def per_warp_int8(
     BLKQ: int =128,
     WARPQ: int =32,
     BLKK: int =64,
-    WARPK: int =16,
+    WARPK: int =16,  # unused (K_GRAN=kPerBlock), kept for backward compat
     tensor_layout: str ="HND"
 ):
     """
@@ -181,10 +181,9 @@ def per_warp_int8(
     else:
         _fused.quant_per_block_int8_cuda(k, k_int8, k_scale_block, BLKK, _tensor_layout)
 
-    # SM75 kernel indexes K scales per warp, so expand block scales to match.
-    k_scale = k_scale_block.repeat_interleave(BLKK // WARPK, dim=-1)
-    
-    return q_int8, q_scale, k_int8, k_scale
+    # K_GRAN is always kPerBlock in the kernel (matching official SageAttention).
+    # Return per-block k_scale directly — no repeat_interleave needed.
+    return q_int8, q_scale, k_int8, k_scale_block
 
 def sub_mean(
     v: torch.Tensor, 

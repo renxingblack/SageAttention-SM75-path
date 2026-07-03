@@ -583,14 +583,15 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn_sm75(
               // Quant Granularity Checks
                if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
                {
+                 // K_GRAN=kPerBlock for per_warp: key_scale has per-block shape
+                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75)));
                  CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75)));
-                 // K_scale: per-warp layout (matching kernel body K_GRAN indexing)
-                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75) * (CTA_K_SM75 / WARP_K_SM75)));
                }
                else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread))
                {
-                 CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75) * 8));
+                 // K_GRAN=kPerThread for per_thread: key_scale has per-thread shape
                  CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75) * (CTA_K_SM75 / WARP_K_SM75) * 4));
+                 CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75) * 8));
                }
 
               // Calculate shared memory size.
@@ -609,9 +610,16 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn_sm75(
                                  CTA_K_SM75 * HEAD_DIM_PADDED_FP16_WRAP * sizeof(half) +
                                  NUM_WARPS_WRAP * P_TILE_ELEMS_WRAP * sizeof(half);
 
+              // K_GRAN: kPerBlock for per_warp (matching official SageAttention),
+              // kPerThread for per_thread (both Q and K use per-thread granularity).
+              constexpr QuantGranularity K_GRAN_DISPATCH =
+                  (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
+                  ? QuantGranularity::kPerBlock
+                  : static_cast<QuantGranularity>(QK_QUANT_GRAN);
+
               auto kernel_func = qk_int8_sv_f16_accum_f32_attn_kernel_sm75<
                                       CTA_Q_SM75, CTA_K_SM75, WARP_Q_SM75, WARP_K_SM75, HEAD_DIM,
-                                      static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN),
+                                      static_cast<QuantGranularity>(QK_QUANT_GRAN), K_GRAN_DISPATCH,
                                       DTypeOut, mask_mode, RETURN_LSE>;
 
               cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
@@ -731,11 +739,11 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn_sm75_smem_o(
               constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
               if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp)) {
+                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75)));
                  CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75)));
-                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75) * (CTA_K_SM75 / WARP_K_SM75)));
               } else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread)) {
-                 CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75) * 8));
                  CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75) * (CTA_K_SM75 / WARP_K_SM75) * 4));
+                 CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75) * 8));
               }
 
               constexpr uint32_t SHMEM_PADDING_BYTES_WRAP = 16;
@@ -750,9 +758,15 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn_sm75_smem_o(
                                  NUM_WARPS_WRAP * P_TILE_ELEMS_WRAP * sizeof(half) +
                                  CTA_Q_SM75 * HEAD_DIM * sizeof(half);  // + smem_O
 
+              // K_GRAN: kPerBlock for per_warp, kPerThread for per_thread.
+              constexpr QuantGranularity K_GRAN_DISPATCH =
+                  (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
+                  ? QuantGranularity::kPerBlock
+                  : static_cast<QuantGranularity>(QK_QUANT_GRAN);
+
               auto kernel_func = qk_int8_sv_f16_accum_f32_attn_kernel_sm75<
                   CTA_Q_SM75, CTA_K_SM75, WARP_Q_SM75, WARP_K_SM75, HEAD_DIM,
-                  static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN),
+                  static_cast<QuantGranularity>(QK_QUANT_GRAN), K_GRAN_DISPATCH,
                   DTypeOut, mask_mode, RETURN_LSE, true>;  // USE_SMEM_O_OUTPUT=true
 
               cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);

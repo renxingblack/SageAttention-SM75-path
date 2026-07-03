@@ -15,11 +15,14 @@
 
 ---
 
-## ⚠️ Статус: В разработке (Shape fix + per_thread fix применены, нужна пересборка и тест)
+## ⚠️ Статус: K_GRAN fix применён — нужна пересборка и тест
 
-> **ВАЖНО (2026-07-03):** Исправлены два критических бага:
-> 1. **key_scale shape mismatch** — CHECK_SHAPE в `qk_int8_sv_f16_accum_f32_attn_sm75` ошибочно ожидал per-block форму, а ядро и Python выдают per-warp.
-> 2. **per_thread scale indexing** — в теле ядра отсутствовали per_thread ветки для q_scale/k_scale, код падал в per-block индексацию. Добавлены static_assert и per_thread ветки + guard в core.py для тримминга q_scale.
+> **ВАЖНО (2026-07-03):** Исправлен архитектурный баг: K_GRAN теперь всегда `kPerBlock` (как в официальном SageAttention). Раньше был ошибочно форсирован в `kPerWarp`, что требовало `repeat_interleave` костыля и вызывало шум на реальном инференсе.
+> 
+> **Изменения (3 файла):**
+> - `csrc/qattn/attn_cuda_sm75.h` — K_GRAN = `QuantGranularity::kPerBlock` в обеих host-функциях
+> - `sageattention/quant.py` — убран `repeat_interleave` для k_scale
+> - `sageattention/core.py` — упрощён guard для per-block k_scale
 > 
 > **Требуется:** пересборка (`python setup.py build_ext --inplace`) и тест в ComfyUI.
 > 

@@ -598,28 +598,22 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     q_seq_len = q.shape[1 if tensor_layout == "NHD" else 2]
 
     if qk_quant_gran == "per_warp":
-        # Guard for k_scale: per-block quant may produce per-block layout
-        expected_k_scale_blocks = (kv_seq_len + blkk_quant - 1) // blkk_quant
-        expected_k_scale_warps = expected_k_scale_blocks * (blkk_quant // warpk_quant)
-        if k_scale.shape[-1] == expected_k_scale_blocks:
-            k_scale = k_scale.repeat_interleave(blkk_quant // warpk_quant, dim=-1).contiguous()
-        elif k_scale.shape[-1] != expected_k_scale_warps:
+        # K_GRAN=kPerBlock for per_warp: k_scale must have per-block shape
+        expected_k_scale_blocks = (kv_seq_len + CTA_K_SM75 - 1) // CTA_K_SM75
+        if k_scale.shape[-1] != expected_k_scale_blocks:
             raise RuntimeError(
-                "SM75 key_scale shape mismatch before kernel launch: "
-                f"got {tuple(k_scale.shape)}, expected last dim {expected_k_scale_warps} "
-                f"for k shape {tuple(k_to_quant.shape)}, BLKK={blkk_quant}, WARPK={warpk_quant}"
+                "SM75 key_scale shape mismatch (expected per-block for per_warp): "
+                f"got {tuple(k_scale.shape)}, expected last dim {expected_k_scale_blocks} "
+                f"(div_ceil({kv_seq_len}, {CTA_K_SM75}))"
             )
 
         # Guard for q_scale: quant BLKQ (64) may differ from kernel CTA_Q (32)
-        # quant produces ceil(T/64)*4 scales, but kernel expects ceil(T/32)*2
-        # First ceil(T/32)*2 entries in q_scale map 1:1 to kernel warps
         expected_q_scales = (q_seq_len + CTA_Q_SM75 - 1) // CTA_Q_SM75 * (CTA_Q_SM75 // WARP_Q_SM75)
         if q_scale.shape[-1] != expected_q_scales:
             q_scale = q_scale[..., :expected_q_scales].contiguous()
 
     elif qk_quant_gran == "per_thread":
-        # Guard for k_scale: Python and C++ both use block size 64, so shapes
-        # should always match. Raise RuntimeError if they don't (indicates bug).
+        # K_GRAN=kPerThread for per_thread: k_scale must have per-thread shape
         expected_k_scales = (kv_seq_len + CTA_K_SM75 - 1) // CTA_K_SM75 * (CTA_K_SM75 // WARP_K_SM75) * 4
         if k_scale.shape[-1] != expected_k_scales:
             raise RuntimeError(
@@ -628,9 +622,7 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
                 f"(div_ceil({kv_seq_len}, {CTA_K_SM75}) * {CTA_K_SM75 // WARP_K_SM75} * 4)"
             )
 
-        # Guard for q_scale: unlike k_scale, quant BLKQ (64) differs from kernel
-        # CTA_Q (32), so Python produces div_ceil(T,64)*32 while kernel expects
-        # div_ceil(T,32)*16. Trim excess entries from Python output to match.
+        # Guard for q_scale: quant BLKQ (64) differs from kernel CTA_Q (32)
         expected_q_scales = (q_seq_len + CTA_Q_SM75 - 1) // CTA_Q_SM75 * (CTA_Q_SM75 // WARP_Q_SM75) * 8
         if q_scale.shape[-1] != expected_q_scales:
             q_scale = q_scale[..., :expected_q_scales].contiguous()
@@ -642,11 +634,10 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     if v.dtype != torch.float16:
         v = v.to(torch.float16)
 
-    # Call the SM75 CUDA kernel C++ binding (smem_o staging variant for debugging)
+    # Call the SM75 CUDA kernel C++ binding
     # Note: Pass padded tensors (q_int8, k_int8, v) and padded head_dim to the C++ function
     # The C++ function itself will use the correct head_dim template parameter
-    # DEBUG: Using smem_o variant to isolate noise bug (direct vs staging output store)
-    lse = _qattn_sm75.qk_int8_sv_f16_accum_f32_attn_sm75_smem_o(
+    lse = _qattn_sm75.qk_int8_sv_f16_accum_f32_attn_sm75(
         q_int8, k_int8, v, o, q_scale, k_scale,
         _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse
     )

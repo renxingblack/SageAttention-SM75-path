@@ -1,24 +1,40 @@
 # 🐛 Known Issues
 
-## ✅ FIXED: key_scale shape mismatch (2026-07-03)
+## ✅ FIXED: K_GRAN always kPerBlock — architectural mismatch with official SageAttention (2026-07-03)
 
 **Status:** 🟢 FIXED
 
-**Root cause:** CHECK_SHAPE в `qk_int8_sv_f16_accum_f32_attn_sm75` ожидал per-block форму `div_ceil(kv_len, 64)` для `key_scale`, но тело ядра и Python выдают per-warp форму `div_ceil(kv_len, 64) * 4`. smem_o вариант уже был исправлен.
+**Root cause:** Our SM75 kernel forced `K_GRAN = kPerWarp` (same as Q_GRAN), requiring per-warp k_scale tensors. The official SageAttention ALWAYS uses `K_GRAN = kPerBlock` regardless of Q_GRAN. This caused:
+1. Need for `repeat_interleave` hack in quant.py to inflate per-block k_scale to per-warp shape
+2. Shape mismatch requiring guards and CHECK_SHAPE fixes
+3. Numerical noise on real inference (kernel used correct-looking but architecturally wrong indexing)
 
-**Fix:** `csrc/qattn/attn_cuda_sm75.h` — изменены CHECK_SHAPE для key_scale в per_warp и per_thread ветках.
+**Fixes (6 locations across 3 files):**
+- `csrc/qattn/attn_cuda_sm75.h`: K_GRAN = `QuantGranularity::kPerBlock` in both kernel instantiations; CHECK_SHAPE for key_scale reverted to per-block form
+- `sageattention/quant.py`: Removed `repeat_interleave` hack for k_scale in `per_warp_int8`
+- `sageattention/core.py`: Simplified k_scale guard to per-block shape verification; removed per-warp k_scale expansion logic
 
 ---
 
-## ✅ FIXED: per_thread scale indexing bug (2026-07-03)
+## ✅ FIXED: key_scale shape mismatch (2026-07-03) — SUPERSEDED by K_GRAN fix above
+
+**Status:** 🟢 FIXED (superseded)
+
+**Root cause:** CHECK_SHAPE в `qk_int8_sv_f16_accum_f32_attn_sm75` ожидал per-block форму `div_ceil(kv_len, 64)` для `key_scale`, но тело ядра и Python выдают per-warp форму `div_ceil(kv_len, 64) * 4`. smem_o вариант уже был исправлен.
+
+**Fix:** `csrc/qattn/attn_cuda_sm75.h` — изменены CHECK_SHAPE для key_scale в per_warp и per_thread ветках. (Позже заменён на правильное архитектурное решение — K_GRAN=kPerBlock.)
+
+---
+
+## ✅ FIXED: per_thread scale indexing bug (2026-07-03) — SUPERSEDED by K_GRAN fix above
 
 **Status:** 🟢 FIXED
 
-**Root cause:** В теле ядра для q_scale и k_scale были только ветки `kPerWarp` и `else` (per-block). Когда `Q_GRAN == kPerThread` или `K_GRAN == kPerThread`, код попадал в `else` и использовал per-block индексацию вместо per-thread, что не совпадало с CHECK_SHAPE и Python-формой тензоров.
+**Root cause:** В теле ядра для q_scale и k_scale были только ветки `kPerWarp` и `else` (per-block). Когда `Q_GRAN == kPerThread` или `K_GRAN == kPerThread`, код попадал в `else` и использовал per-block индексацию вместо per-thread.
 
 **Fixes:**
 1. `csrc/qattn/attn_cuda_sm75.h` — добавлены static_assert для Q_GRAN/K_GRAN, добавлены per_thread ветки индексации q_scale и k_scale
-2. `sageattention/core.py` — добавлен guard для q_scale в per_thread пути: тримминг `q_scale[..., :expected_q_scales].contiguous()` (Python `per_thread_int8` использует BLKQ=64, а C++ CHECK_SHAPE ждёт CTA_Q=32)
+2. `sageattention/core.py` — добавлен guard для q_scale в per_thread пути: тримминг `q_scale[..., :expected_q_scales].contiguous()`
 
 ---
 

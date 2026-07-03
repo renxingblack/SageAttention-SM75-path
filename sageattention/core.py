@@ -570,7 +570,7 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     # Quantization (Using CUDA fused kernels - requires FUSED_ENABLED check)
     # Use per_warp as the default/recommended for SM75 unless per_thread is proven efficient
     # Example BLK/WARP sizes - THESE MAY NEED TUNING FOR SM75 PERFORMANCE
-    blkq_quant = 32
+    blkq_quant = 64
     warpq_quant = 16 # Example
     blkk_quant = 64
     warpk_quant = 16 # Must match SM75 kernel WARP_K

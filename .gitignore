@@ -4,6 +4,7 @@
 *.mp4
 /dist
 /test
+PLAN.md
 __pycache__
 *.so
 evaluate/

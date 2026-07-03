@@ -1,5 +1,24 @@
 # 🐛 Known Issues
 
+## ✅ FIXED: INT8 MMA `ldmatrix` incompatibility on Turing SM75 — **NOISE BUG** (2026-07-03)
+
+**Status:** 🟢 FIXED (ждёт тестирования)
+
+**Root cause:** SM75 kernel использовал `ldmatrix_m8n8x4` для загрузки INT8 операндов Q/K
+в `m8n8k16` INT8 MMA. На Turing (SM75), `ldmatrix` распределяет данные в **FP16** tensor core
+layout, который несовместим с **INT8** MMA fragment layout. Каждый MMA вызов перемножал
+неправильные элементы матриц → чистый математический шум.
+
+**Fix:** Заменён `ldmatrix_m8n8x4` на ручные `uint32_t` загрузки из shared memory с правильным
+INT8 MMA fragment mapping: `row = lane_id / 4`, `col_chunk = lane_id % 4`. Также обновлены
+softmax `global_q_idx` и P-store row offset с `lane_id % 8` на `lane_id / 4`.
+
+**Файл:** `csrc/qattn/attn_cuda_sm75.h` (тело ядра, обе функции)
+
+**Требуется пересборка:** `python setup.py build_ext --inplace`
+
+---
+
 ## ✅ FIXED: K_GRAN always kPerBlock — architectural mismatch with official SageAttention (2026-07-03)
 
 **Status:** 🟢 FIXED

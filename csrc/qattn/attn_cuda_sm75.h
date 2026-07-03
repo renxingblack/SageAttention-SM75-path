@@ -260,23 +260,33 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
                 #pragma unroll
                 for(int acc_idx = 0; acc_idx < NUM_QK_ACCUM; ++acc_idx) RS_accum[acc_idx] = 0;
 
+                // SM75 INT8 MMA m8n8k16: use manual ld.shared.b32 (NOT ldmatrix!)
+                // ldmatrix distributes data in FP16 tensor core layout, incompatible with
+                // Turing INT8 MMA fragment layout. On Turing, INT8 MMA fragments use:
+                //   row = lane_id / 4,  col_chunk = lane_id % 4  (4 int8s per chunk)
+                // The MMA internally iterates M=8 across groups of 4 lanes, and K=16
+                // across 4 col chunks. All 32 lanes participate: lanes 0-7 handle rows
+                // 0-1, lanes 8-15 handle rows 2-3, etc.
                 #pragma unroll
                 for(int hk = 0; hk < head_dim / MMA_QK_K_SM75; ++hk) {
-                    int8_t* smem_Q_ptr = smem_Q + (q_start_warp + mq * MMA_QK_M_SM75 + lane_id % 8) * HEAD_DIM_PADDED_INT8 + hk * MMA_QK_K_SM75;
-                    uint32_t q_frag_reg_load[4] = {0, 0, 0, 0};
-                    mma::ldmatrix_m8n8x4(q_frag_reg_load, smem_Q_ptr);
-                    uint32_t q_frag_reg[1] = {q_frag_reg_load[0]};
+                    int q_row = q_start_warp + mq * MMA_QK_M_SM75 + lane_id / 4;
+                    int q_col = hk * MMA_QK_K_SM75 + (lane_id % 4) * 4;
+                    int8_t* smem_Q_ptr = smem_Q + q_row * HEAD_DIM_PADDED_INT8 + q_col;
+                    uint32_t q_frag_reg[1] = { *reinterpret_cast<uint32_t*>(smem_Q_ptr) };
 
-                    int8_t* smem_K_ptr = smem_K + (k_start_warp + nk * MMA_QK_N_SM75 + lane_id % 8) * HEAD_DIM_PADDED_INT8 + hk * MMA_QK_K_SM75;
-                    uint32_t k_frag_reg_load[4] = {0, 0, 0, 0};
-                    mma::ldmatrix_m8n8x4(k_frag_reg_load, smem_K_ptr);
-                    uint32_t k_frag_reg[1] = {k_frag_reg_load[0]};
+                    int k_row = k_start_warp + nk * MMA_QK_N_SM75 + lane_id / 4;
+                    int k_col = hk * MMA_QK_K_SM75 + (lane_id % 4) * 4;
+                    int8_t* smem_K_ptr = smem_K + k_row * HEAD_DIM_PADDED_INT8 + k_col;
+                    uint32_t k_frag_reg[1] = { *reinterpret_cast<uint32_t*>(smem_K_ptr) };
 
                     mma::mma_sync_m8n8k16_row_col_s8s8s32<mma::MMAMode::kInplaceUpdate>(RS_accum, q_frag_reg, k_frag_reg);
                 }
 
                 // --- Online Softmax ---
-                uint32_t global_q_idx = q_start_row_block + q_start_warp + mq * MMA_QK_M_SM75 + (lane_id % 8);
+                // With manual INT8 MMA loads using lane_id/4 for row mapping,
+                // each group of 4 lanes handles one Q row. Use lane_id/4 for
+                // global_q_idx to match the data layout.
+                uint32_t global_q_idx = q_start_row_block + q_start_warp + mq * MMA_QK_M_SM75 + (lane_id / 4);
                 uint32_t s_tile_start_col = k_start_row_block + k_start_warp + nk * MMA_QK_N_SM75;
                 uint32_t global_k_idx_0 = s_tile_start_col + (lane_id / 8) * 2;
                 uint32_t global_k_idx_1 = global_k_idx_0 + 1;
@@ -324,8 +334,9 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
 
                 // Write P to shared memory: 16×8 layout, row-major, stride=8
                 // mq=0 writes rows 0-7, mq=1 writes rows 8-15
+                // Use lane_id/4 for row offset (4 threads per Q row in INT8 MMA fragment)
                 half* smem_P_warp = smem_P + warp_id_in_block * P_TILE_ELEMS;
-                uint32_t r = lane_id % 8;
+                uint32_t r = lane_id / 4;
                 uint32_t row_offset = mq * MMA_QK_M_SM75 + r;
                 smem_P_warp[row_offset * MMA_QK_N_SM75 + (lane_id / 8) * 2 + 0] = __float2half_rn(p0);
                 smem_P_warp[row_offset * MMA_QK_N_SM75 + (lane_id / 8) * 2 + 1] = __float2half_rn(p1);

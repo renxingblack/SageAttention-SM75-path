@@ -776,7 +776,7 @@ __device__ __forceinline__ void mma_sync_m8n8k16_row_col_s8s8s32(int32_t* C, uin
   int32_t C_out[2];
   if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
     asm volatile(
-        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+        "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32 "
         "{%0, %1},"
         "{%2},"
         "{%3},"
@@ -787,7 +787,7 @@ __device__ __forceinline__ void mma_sync_m8n8k16_row_col_s8s8s32(int32_t* C, uin
           "r"(C[0]), "r"(C[1]));
   } else {
     asm volatile(
-        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+        "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32 "
         "{%0, %1},"
         "{%2},"
         "{%3},"

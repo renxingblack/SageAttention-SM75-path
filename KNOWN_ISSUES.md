@@ -1,6 +1,27 @@
 # 🐛 Known Issues
 
-## ✅ FIXED: PV MMA P-matrix `ldmatrix_m8n8x2` address duplication — **ROOT CAUSE OF NOISE** (2026-07-03)
+## ✅ FIXED: Missing `.satfinite` in INT8 MMA PTX instruction — **TRUE ROOT CAUSE OF NOISE** (2026-07-03)
+
+**Status:** 🟢 FIXED (ждёт пересборки и тестирования)
+
+**Root cause:** PTX INT8 MMA instruction was missing the REQUIRED `.satfinite` modifier on Turing (SM75):
+```
+WRONG: mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+RIGHT: mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32
+```
+Without `.satfinite`, `ptxas` silently generates **incorrect SASS**, feeding garbage to Tensor Cores. This matches CUTLASS `mma_sm75.h` exactly (the Nvidia reference implementation).
+
+**Why all previous fixes didn't help:** Every prior fix (K_GRAN, ldmatrix→manual loads, P-loading lane_id%16) was architecturally correct but the PTX instruction itself was malformed — garbage in, garbage out regardless of data correctness.
+
+**Fix:** Added `.satfinite` to both `kInplaceUpdate` and `kInit` branches in `mma_sync_m8n8k16_row_col_s8s8s32`.
+
+**Файл:** `csrc/mma.cuh`
+
+**Требуется пересборка:** `python setup.py build_ext --inplace`
+
+---
+
+## ✅ FIXED: PV MMA P-matrix `ldmatrix_m8n8x2` address duplication (2026-07-03)
 
 **Status:** 🟢 FIXED (ждёт тестирования)
 

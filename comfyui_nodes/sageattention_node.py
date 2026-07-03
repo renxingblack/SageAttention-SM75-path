@@ -67,6 +67,7 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
     sage_ok_count = 0
     fallback_mask_count = 0
     fallback_err_count = 0
+    logged_shapes = set()
     _kernel_broken = False
     _max_fails = 3
 

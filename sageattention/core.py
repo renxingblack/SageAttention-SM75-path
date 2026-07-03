@@ -592,7 +592,7 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
         expected_k_scale_blocks = (k_to_quant.shape[1 if tensor_layout == "NHD" else 2] + blkk_quant - 1) // blkk_quant
         expected_k_scale_warps = expected_k_scale_blocks * (blkk_quant // warpk_quant)
         if k_scale.shape[-1] == expected_k_scale_blocks:
-            k_scale = k_scale.repeat_interleave(blkk_quant // warpk_quant, dim=-1)
+            k_scale = k_scale.repeat_interleave(blkk_quant // warpk_quant, dim=-1).contiguous()
         elif k_scale.shape[-1] != expected_k_scale_warps:
             raise RuntimeError(
                 "SM75 key_scale shape mismatch before kernel launch: "
@@ -608,7 +608,7 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
         WARP_Q_SM75 = 16  # Must match attn_cuda_sm75.h
         expected_q_scales = (q_seq_len + CTA_Q_SM75 - 1) // CTA_Q_SM75 * (CTA_Q_SM75 // WARP_Q_SM75)
         if q_scale.shape[-1] != expected_q_scales:
-            q_scale = q_scale[..., :expected_q_scales]
+            q_scale = q_scale[..., :expected_q_scales].contiguous()
 
     # Output tensor (always FP16 for this kernel)
     o = torch.empty(q.shape, dtype=torch.float16, device=q.device)

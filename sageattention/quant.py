@@ -62,7 +62,7 @@ def per_block_int8(
         - The quantized query tensor. Shape: Same as `q` but with `int8` dtype.
         - The scale tensor of the query tensor. Shape: ``[batch_size, num_qo_heads, (qo_len + BLKQ - 1) // BLKQ]`` with `float32` dtype.
         - The quantized key tensor. Shape: Same as `k` but with `int8` dtype.
-        - The scale tensor of the key tensor. Shape: ``[batch_size, num_kv_heads, (kv_len + BLKK - 1) // BLKK]`` with `float32` dtype.
+        - The scale tensor of the key tensor. Shape: ``[batch_size, num_kv_heads, (kv_len + BLKK - 1) // BLKK * (BLKK // WARPK)]`` with `float32` dtype.
     
     Note
     ----
@@ -86,7 +86,7 @@ def per_block_int8(
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
 
     q_scale = torch.empty((b, h_qo, (qo_len + BLKQ - 1) // BLKQ), device=q.device, dtype=torch.float32)
-    k_scale = torch.empty((b, h_kv, (kv_len + BLKK - 1) // BLKK), device=q.device, dtype=torch.float32)
+    k_scale_block = torch.empty((b, h_kv, (kv_len + BLKK - 1) // BLKK), device=q.device, dtype=torch.float32)
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -96,9 +96,12 @@ def per_block_int8(
     _fused.quant_per_block_int8_cuda(q, q_int8, q_scale, sm_scale, BLKQ, _tensor_layout)
     if km is not None:
         km = km.squeeze(1) if _tensor_layout == 0 else km.squeeze(2)
-        _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, km, k_int8, k_scale, BLKK, _tensor_layout)
+        _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, km, k_int8, k_scale_block, BLKK, _tensor_layout)
     else:
-        _fused.quant_per_block_int8_cuda(k, k_int8, k_scale, BLKK, _tensor_layout)
+        _fused.quant_per_block_int8_cuda(k, k_int8, k_scale_block, BLKK, _tensor_layout)
+
+    # Expand block-level K scales to the per-warp layout expected by the SM75 kernel.
+    k_scale = k_scale_block.repeat_interleave(BLKK // WARPK, dim=-1)
 
     return q_int8, q_scale, k_int8, k_scale
 
@@ -109,6 +112,7 @@ def per_warp_int8(
     BLKQ: int =128,
     WARPQ: int =32,
     BLKK: int =64,
+    WARPK: int =16,
     tensor_layout: str ="HND"
 ):
     """

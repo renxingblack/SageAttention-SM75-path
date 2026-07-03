@@ -573,11 +573,11 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     blkq_quant = 64
     warpq_quant = 16 # Example
     blkk_quant = 64
-    warpk_quant = 32 # Example, ensure consistency if quant kernel uses it
+    warpk_quant = 16 # Must match SM75 kernel WARP_K
 
     if qk_quant_gran == "per_warp":
         # Assuming per_warp_int8_cuda handles the optional mean subtraction internally if km is passed
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k_to_quant, km=km_padded, tensor_layout=tensor_layout, BLKQ=blkq_quant, WARPQ=warpq_quant, BLKK=blkk_quant)
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k_to_quant, km=km_padded, tensor_layout=tensor_layout, BLKQ=blkq_quant, WARPQ=warpq_quant, BLKK=blkk_quant, WARPK=warpk_quant)
     elif qk_quant_gran == "per_thread":
         # NOTE: Fused per_thread CUDA kernel not provided, using Triton fallback
         # This might impact performance significantly.

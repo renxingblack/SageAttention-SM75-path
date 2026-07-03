@@ -170,8 +170,5 @@ setup(
     python_requires='>=3.9',
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
-    install_requires=[
-        'torch>=2.3.0',
-        'triton>=3.0.0',
-    ],
+    install_requires=[],
 )

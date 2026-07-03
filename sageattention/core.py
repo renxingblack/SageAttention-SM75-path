@@ -642,10 +642,11 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     if v.dtype != torch.float16:
         v = v.to(torch.float16)
 
-    # Call the SM75 CUDA kernel C++ binding
+    # Call the SM75 CUDA kernel C++ binding (smem_o staging variant for debugging)
     # Note: Pass padded tensors (q_int8, k_int8, v) and padded head_dim to the C++ function
     # The C++ function itself will use the correct head_dim template parameter
-    lse = _qattn_sm75.qk_int8_sv_f16_accum_f32_attn_sm75(
+    # DEBUG: Using smem_o variant to isolate noise bug (direct vs staging output store)
+    lse = _qattn_sm75.qk_int8_sv_f16_accum_f32_attn_sm75_smem_o(
         q_int8, k_int8, v, o, q_scale, k_scale,
         _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse
     )

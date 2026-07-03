@@ -376,15 +376,16 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
             #pragma unroll
             for(int fk = 0; fk < NUM_N_V_TILES; ++fk) {
                 // Load P fragment (A operand, 2 b32 registers).
-                // P is 16×8: two unconditional ldmatrix calls (top 8 rows, bottom 8 rows),
-                // then select per-thread-group. Avoids predication on ldmatrix.
-                uint32_t p_top[2] = {0, 0};
-                uint32_t p_bot[2] = {0, 0};
-                mma::ldmatrix_m8n8x2(p_top, smem_P_warp + (lane_id % 8) * MMA_QK_N_SM75);
-                mma::ldmatrix_m8n8x2(p_bot, smem_P_warp + MMA_QK_M_SM75 * MMA_QK_N_SM75 + (lane_id % 8) * MMA_QK_N_SM75);
-                uint32_t p_frag[2];
-                p_frag[0] = (lane_id < 16) ? p_top[0] : p_bot[0];
-                p_frag[1] = (lane_id < 16) ? p_top[1] : p_bot[1];
+                // P is 16×8 fp16 tile, row-major with stride=MMA_QK_N_SM75=8.
+                // ldmatrix.m8n8.x2 loads TWO 8×8 matrices: lanes 0-7 provide
+                // addresses for matrix 0 (rows 0-7), lanes 8-15 for matrix 1
+                // (rows 8-15). Using lane_id % 16 gives all 16 unique rows,
+                // which matches the m16n8k8 MMA A operand layout exactly.
+                // CRITICAL: previously used p_top/p_bot with lane_id%8, which
+                // duplicated row addresses for lanes 8-15, loading identical
+                // rows 0-7 twice instead of rows 0-15 — caused pure NOISE.
+                uint32_t p_frag[2] = {0, 0};
+                mma::ldmatrix_m8n8x2(p_frag, smem_P_warp + (lane_id % 16) * MMA_QK_N_SM75);
 
                 // Load V fragment (B operand, 1 b32 register)
                 // V is row-major: row = k_start_warp + nk * 8 + lane_id % 8, col = fk * 8

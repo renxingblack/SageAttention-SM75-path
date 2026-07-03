@@ -1,6 +1,22 @@
 # 🐛 Known Issues
 
-## ✅ FIXED: INT8 MMA `ldmatrix` incompatibility on Turing SM75 — **NOISE BUG** (2026-07-03)
+## ✅ FIXED: PV MMA P-matrix `ldmatrix_m8n8x2` address duplication — **ROOT CAUSE OF NOISE** (2026-07-03)
+
+**Status:** 🟢 FIXED (ждёт тестирования)
+
+**Root cause:** PV MMA section used dual `ldmatrix_m8n8x2` calls (`p_top`/`p_bot`) with `lane_id % 8` for row addresses. `ldmatrix.m8n8.x2` takes addresses from lanes 0-7 (Matrix 0) and lanes 8-15 (Matrix 1). Using `lane_id % 8` caused lanes 8-15 to DUPLICATE addresses from lanes 0-7, loading rows 0-7 twice instead of rows 0-15. The P (attention) matrix became garbage before multiplication with V → **pure noise output**.
+
+**Why synthetic tests passed:** Small seq_len (64-256) meant P values were mostly zeros/small, masking the ldmatrix corruption. Real inference (seq_len=5852) exposed the bug.
+
+**Fix:** Single `ldmatrix_m8n8x2(p_frag, smem_P_warp + (lane_id % 16) * MMA_QK_N_SM75)` — lanes 0-7 give rows 0-7, lanes 8-15 give rows 8-15, correctly forming the 16×8 fragment for m16n8k8 MMA.
+
+**Файл:** `csrc/qattn/attn_cuda_sm75.h`
+
+**Требуется пересборка:** `python setup.py build_ext --inplace`
+
+---
+
+## ✅ FIXED: INT8 MMA `ldmatrix` incompatibility on Turing SM75 (2026-07-03)
 
 **Status:** 🟢 FIXED (ждёт тестирования)
 

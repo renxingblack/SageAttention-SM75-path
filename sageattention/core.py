@@ -656,9 +656,6 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     else:
         return o
 
-    """
-    SageAttention with INT8 quantization for Q and K, FP8 PV with FP32 accumulation, implemented using CUDA.
-
     Parameters
     ----------
     q : torch.Tensor

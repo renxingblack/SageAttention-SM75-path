@@ -15,9 +15,11 @@
 
 ---
 
-## ⚠️ Статус: В разработке (Shape fix применён, нужна пересборка и тест)
+## ⚠️ Статус: В разработке (Shape fix + per_thread fix применены, нужна пересборка и тест)
 
-> **ВАЖНО (2026-07-03):** Исправлен критический баг `key_scale shape mismatch` в `attn_cuda_sm75.h`. CHECK_SHAPE для key_scale в функции `qk_int8_sv_f16_accum_f32_attn_sm75` ошибочно ожидал per-block форму (`div_ceil(kv_len, 64)`), а ядро и Python выдают per-warp (`div_ceil(kv_len, 64) * 4`). Приведено в соответствие с smem_o вариантом.
+> **ВАЖНО (2026-07-03):** Исправлены два критических бага:
+> 1. **key_scale shape mismatch** — CHECK_SHAPE в `qk_int8_sv_f16_accum_f32_attn_sm75` ошибочно ожидал per-block форму, а ядро и Python выдают per-warp.
+> 2. **per_thread scale indexing** — в теле ядра отсутствовали per_thread ветки для q_scale/k_scale, код падал в per-block индексацию. Добавлены static_assert и per_thread ветки + guard в core.py для тримминга q_scale.
 > 
 > **Требуется:** пересборка (`python setup.py build_ext --inplace`) и тест в ComfyUI.
 > 

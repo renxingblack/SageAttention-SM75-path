@@ -2,11 +2,23 @@
 
 ## ✅ FIXED: key_scale shape mismatch (2026-07-03)
 
-**Status:** 🟢 FIXED (commit pending)
+**Status:** 🟢 FIXED
 
 **Root cause:** CHECK_SHAPE в `qk_int8_sv_f16_accum_f32_attn_sm75` ожидал per-block форму `div_ceil(kv_len, 64)` для `key_scale`, но тело ядра и Python выдают per-warp форму `div_ceil(kv_len, 64) * 4`. smem_o вариант уже был исправлен.
 
 **Fix:** `csrc/qattn/attn_cuda_sm75.h` — изменены CHECK_SHAPE для key_scale в per_warp и per_thread ветках.
+
+---
+
+## ✅ FIXED: per_thread scale indexing bug (2026-07-03)
+
+**Status:** 🟢 FIXED
+
+**Root cause:** В теле ядра для q_scale и k_scale были только ветки `kPerWarp` и `else` (per-block). Когда `Q_GRAN == kPerThread` или `K_GRAN == kPerThread`, код попадал в `else` и использовал per-block индексацию вместо per-thread, что не совпадало с CHECK_SHAPE и Python-формой тензоров.
+
+**Fixes:**
+1. `csrc/qattn/attn_cuda_sm75.h` — добавлены static_assert для Q_GRAN/K_GRAN, добавлены per_thread ветки индексации q_scale и k_scale
+2. `sageattention/core.py` — добавлен guard для q_scale в per_thread пути: тримминг `q_scale[..., :expected_q_scales].contiguous()` (Python `per_thread_int8` использует BLKQ=64, а C++ CHECK_SHAPE ждёт CTA_Q=32)
 
 ---
 

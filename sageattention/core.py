@@ -587,9 +587,19 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
     else:
          raise ValueError(f"Invalid qk_quant_gran: {qk_quant_gran}")
 
+    # SM75 kernel constants (must match attn_cuda_sm75.h)
+    CTA_Q_SM75 = 32
+    WARP_Q_SM75 = 16
+    CTA_K_SM75 = 64
+    WARP_K_SM75 = 16
+
+    # Sequence lengths (padded, as passed to kernel)
+    kv_seq_len = k_to_quant.shape[1 if tensor_layout == "NHD" else 2]
+    q_seq_len = q.shape[1 if tensor_layout == "NHD" else 2]
+
     if qk_quant_gran == "per_warp":
         # Guard for k_scale: per-block quant may produce per-block layout
-        expected_k_scale_blocks = (k_to_quant.shape[1 if tensor_layout == "NHD" else 2] + blkk_quant - 1) // blkk_quant
+        expected_k_scale_blocks = (kv_seq_len + blkk_quant - 1) // blkk_quant
         expected_k_scale_warps = expected_k_scale_blocks * (blkk_quant // warpk_quant)
         if k_scale.shape[-1] == expected_k_scale_blocks:
             k_scale = k_scale.repeat_interleave(blkk_quant // warpk_quant, dim=-1).contiguous()
@@ -603,10 +613,25 @@ def sageattn_qk_int8_pv_fp16_cuda_sm75(
         # Guard for q_scale: quant BLKQ (64) may differ from kernel CTA_Q (32)
         # quant produces ceil(T/64)*4 scales, but kernel expects ceil(T/32)*2
         # First ceil(T/32)*2 entries in q_scale map 1:1 to kernel warps
-        q_seq_len = q.shape[1 if tensor_layout == "NHD" else 2]
-        CTA_Q_SM75 = 32  # Must match attn_cuda_sm75.h
-        WARP_Q_SM75 = 16  # Must match attn_cuda_sm75.h
         expected_q_scales = (q_seq_len + CTA_Q_SM75 - 1) // CTA_Q_SM75 * (CTA_Q_SM75 // WARP_Q_SM75)
+        if q_scale.shape[-1] != expected_q_scales:
+            q_scale = q_scale[..., :expected_q_scales].contiguous()
+
+    elif qk_quant_gran == "per_thread":
+        # Guard for k_scale: Python and C++ both use block size 64, so shapes
+        # should always match. Raise RuntimeError if they don't (indicates bug).
+        expected_k_scales = (kv_seq_len + CTA_K_SM75 - 1) // CTA_K_SM75 * (CTA_K_SM75 // WARP_K_SM75) * 4
+        if k_scale.shape[-1] != expected_k_scales:
+            raise RuntimeError(
+                "SM75 key_scale shape mismatch for per_thread: "
+                f"got {tuple(k_scale.shape)}, expected last dim {expected_k_scales} "
+                f"(div_ceil({kv_seq_len}, {CTA_K_SM75}) * {CTA_K_SM75 // WARP_K_SM75} * 4)"
+            )
+
+        # Guard for q_scale: unlike k_scale, quant BLKQ (64) differs from kernel
+        # CTA_Q (32), so Python produces div_ceil(T,64)*32 while kernel expects
+        # div_ceil(T,32)*16. Trim excess entries from Python output to match.
+        expected_q_scales = (q_seq_len + CTA_Q_SM75 - 1) // CTA_Q_SM75 * (CTA_Q_SM75 // WARP_Q_SM75) * 8
         if q_scale.shape[-1] != expected_q_scales:
             q_scale = q_scale[..., :expected_q_scales].contiguous()
 

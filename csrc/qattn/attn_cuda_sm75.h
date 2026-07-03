@@ -73,6 +73,11 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
     // WARP_Q must be >= MMA_SV_M for m16n8k8 PV MMA
     static_assert(WARP_Q >= MMA_SV_M_SM75,
         "WARP_Q must be >= MMA_SV_M_SM75 (16) for m16n8k8 PV MMA");
+    // Validate quantization granularity
+    static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread,
+        "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
+    static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread,
+        "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
 
     // --- Thread/Block Indexing ---
     const uint32_t lane_id = threadIdx.x % 32; // Lane index within the warp (0-31)
@@ -172,6 +177,10 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
          uint32_t num_warp_block_q = gridDim.x * warps_per_cta_q;
          uint32_t q_scale_idx = batch_id * num_qo_heads * num_warp_block_q + head_id * num_warp_block_q + bx * warps_per_cta_q + warp_idx_q;
          q_scale_val = Q_scale[q_scale_idx];
+    } else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
+         uint32_t num_warp_block_q = gridDim.x * warps_per_cta_q;
+         uint32_t q_scale_idx = batch_id * num_qo_heads * num_warp_block_q * 8 + head_id * num_warp_block_q * 8 + bx * warps_per_cta_q * 8 + warp_idx_q * 8 + lane_id / 4;
+         q_scale_val = Q_scale[q_scale_idx];
     } else {
          uint32_t num_block_q = gridDim.x;
          uint32_t q_scale_idx = batch_id * num_qo_heads * num_block_q + head_id * num_block_q + bx;
@@ -214,6 +223,10 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
         if constexpr (K_GRAN == QuantGranularity::kPerWarp) {
              uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * warps_per_cta_k;
              uint32_t k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * num_warp_block_k + kv_head_id * num_warp_block_k + k_tile_idx * warps_per_cta_k + warp_idx_k;
+             k_scale_val = K_scale[k_scale_idx];
+        } else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
+             uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * warps_per_cta_k;
+             uint32_t k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * num_warp_block_k * 4 + kv_head_id * num_warp_block_k * 4 + k_tile_idx * warps_per_cta_k * 4 + warp_idx_k * 4 + lane_id % 4;
              k_scale_val = K_scale[k_scale_idx];
         } else {
              uint32_t num_block_k = div_ceil(kv_len, CTA_K);

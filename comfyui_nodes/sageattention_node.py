@@ -63,6 +63,10 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
 
     # Self-disable: после N последовательных неудач больше не пытаемся
     # (каждый вызов sageattn с падением платит overhead FP32→FP16 + reshape)
+    call_count = 0
+    sage_ok_count = 0
+    fallback_mask_count = 0
+    fallback_err_count = 0
     _kernel_broken = False
     _max_fails = 3
 
@@ -73,7 +77,7 @@ def _create_sage_attn_func(smooth_k=True, qk_quant_gran="per_warp"):
 
         Self-disable: после {_max_fails} неудач просто вызывает fallback.
         """
-        nonlocal call_count, sage_ok_count, fallback_mask_count, fallback_err_count, _kernel_broken
+        nonlocal _kernel_broken
         call_count += 1
 
         # --- Diagnostic: log first 3 unique shapes ---

@@ -372,3 +372,8 @@ def _masked_attention(q, k, v, heads, mask, transformer_options={}, **kwargs):
 - LTX Director с одним глобальным промптом (без сегментов) → Sage должен работать
 - LTX Director с несколькими сегментами → masked attention обходится (ожидаемо)
 - Retake Mode → проверить что Sage не мешает
+
+### 10.5. ComfyUI node import fix [DONE]
+- Исправлен `SyntaxError: no binding for nonlocal 'call_count' found` в `comfyui_nodes/sageattention_node.py`.
+- `call_count`, `sage_ok_count`, `fallback_mask_count`, `fallback_err_count` теперь объявлены в enclosing scope внутри `_create_sage_attn_func()`.
+- Это устраняет падение на импорте custom node и позволяет ComfyUI загрузить узел на Kaggle.

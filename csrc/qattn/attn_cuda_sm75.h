@@ -288,7 +288,9 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
                 // global_q_idx to match the data layout.
                 uint32_t global_q_idx = q_start_row_block + q_start_warp + mq * MMA_QK_M_SM75 + (lane_id / 4);
                 uint32_t s_tile_start_col = k_start_row_block + k_start_warp + nk * MMA_QK_N_SM75;
-                uint32_t global_k_idx_0 = s_tile_start_col + (lane_id / 8) * 2;
+                // K-column mapping: groupOf=4, each group of 4 threads covers 2 columns.
+                // Thread t handles K columns (t%4)*2 and (t%4)*2+1.
+                uint32_t global_k_idx_0 = s_tile_start_col + (lane_id % 4) * 2;
                 uint32_t global_k_idx_1 = global_k_idx_0 + 1;
 
                 float s0 = __int2float_rn(RS_accum[0]) * current_dequant_scale;
@@ -338,8 +340,10 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
                 half* smem_P_warp = smem_P + warp_id_in_block * P_TILE_ELEMS;
                 uint32_t r = lane_id / 4;
                 uint32_t row_offset = mq * MMA_QK_M_SM75 + r;
-                smem_P_warp[row_offset * MMA_QK_N_SM75 + (lane_id / 8) * 2 + 0] = __float2half_rn(p0);
-                smem_P_warp[row_offset * MMA_QK_N_SM75 + (lane_id / 8) * 2 + 1] = __float2half_rn(p1);
+                // Column chunk: (lane_id % 4) for 4 unique col chunks per 8 rows.
+                // Each thread writes 2 fp16 values at columns (t%4)*2 and (t%4)*2+1.
+                smem_P_warp[row_offset * MMA_QK_N_SM75 + (lane_id % 4) * 2 + 0] = __float2half_rn(p0);
+                smem_P_warp[row_offset * MMA_QK_N_SM75 + (lane_id % 4) * 2 + 1] = __float2half_rn(p1);
             } // End mq loop
 
             __syncwarp(); // Ensure both mq sub-tiles' P data is written

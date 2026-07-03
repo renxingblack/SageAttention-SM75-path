@@ -232,6 +232,13 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
         #pragma unroll
         for(int nk = 0; nk < NUM_N_TILES; ++nk) {
 
+            // CRITICAL FIX: Save m_i BEFORE mq loop for correct renormalization
+            float m_old[NUM_M_TILES_QK];
+            #pragma unroll
+            for(int i = 0; i < NUM_M_TILES_QK; ++i) {
+                m_old[i] = m_i[i];
+            }
+
             // --- QK MMA + Softmax + P store for both mq sub-tiles ---
             #pragma unroll
             for(int mq = 0; mq < NUM_M_TILES_QK; ++mq) {
@@ -286,23 +293,9 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
                 float m_new = fmaxf(m_prev, m_local);
                 m_i[mq] = m_new;
 
+                // Update denominator scaling (but DON'T renormalize RO yet!)
                 float o_scale = math::ptx_exp2(m_prev - m_new);
                 l_i[mq] *= o_scale;
-
-                // Renormalize PV accumulators — per-thread-group only.
-                // Threads 0-15 produce output rows 0-7 (mq=0 sub-tile),
-                // threads 16-31 produce output rows 8-15 (mq=1 sub-tile).
-                // Only scale threads that belong to this mq's row group.
-                // NOTE: lane_id < 16 is a compile-time-known bool for m16n8k8.
-                if ((mq == 0 && lane_id < 16) || (mq == 1 && lane_id >= 16)) {
-                    #pragma unroll
-                    for(int fk = 0; fk < NUM_N_V_TILES; ++fk) {
-                        RO_accum[fk * 4 + 0] *= o_scale;
-                        RO_accum[fk * 4 + 1] *= o_scale;
-                        RO_accum[fk * 4 + 2] *= o_scale;
-                        RO_accum[fk * 4 + 3] *= o_scale;
-                    }
-                }
 
                 // Compute P = exp2(S * sm_scale - m_new)
                 float p0 = math::ptx_exp2(fmaf(s0, sm_scale, -m_new));
@@ -326,6 +319,24 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel_sm75(
             } // End mq loop
 
             __syncwarp(); // Ensure both mq sub-tiles' P data is written
+
+            // CRITICAL FIX: Renormalize RO AFTER computing both mq but BEFORE PV MMA
+            // This ensures: O_new = exp(m_old - m_new) * O_old + P @ V
+            #pragma unroll
+            for(int mq = 0; mq < NUM_M_TILES_QK; ++mq) {
+                float o_scale = math::ptx_exp2(m_old[mq] - m_i[mq]);
+                // Per-thread-group renormalization
+                // Threads 0-15 handle mq=0 (rows 0-7), threads 16-31 handle mq=1 (rows 8-15)
+                if ((mq == 0 && lane_id < 16) || (mq == 1 && lane_id >= 16)) {
+                    #pragma unroll
+                    for(int fk = 0; fk < NUM_N_V_TILES; ++fk) {
+                        RO_accum[fk * 4 + 0] *= o_scale;
+                        RO_accum[fk * 4 + 1] *= o_scale;
+                        RO_accum[fk * 4 + 2] *= o_scale;
+                        RO_accum[fk * 4 + 3] *= o_scale;
+                    }
+                }
+            }
 
             // --- PV Computation (m16n8k8 FP16 MMA): RO += P × V ---
             // P is 16×8 in smem_P_warp.  V is CTA_K × HEAD_DIM_PADDED_FP16.
@@ -560,12 +571,13 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn_sm75(
                if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
                {
                  CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75)));
-                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75) * (CTA_K_SM75 / WARP_K_SM75)));
+                 // K always uses per-block granularity (WARP_K=16 != CTA_K=64)
+                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75)));
                }
                else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread))
                {
                  CHECK_SHAPE(query_scale, batch_size, num_qo_heads, static_cast<long>(div_ceil(qo_len, CTA_Q_SM75) * (CTA_Q_SM75 / WARP_Q_SM75) * 8));
-                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75) * (CTA_K_SM75 / WARP_K_SM75) * 4));
+                 CHECK_SHAPE(key_scale, batch_size, num_kv_heads, static_cast<long>(div_ceil(kv_len, CTA_K_SM75)));
                }
 
               // Calculate shared memory size.

@@ -28,10 +28,10 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 torch.utils.cpp_extension._check_cuda_version = lambda *a, **kw: None
 
 # Common compiler flags.
-COMMON_CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17"]
+COMMON_CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++20"]
 COMMON_NVCC_FLAGS = [
     "-O3",
-    "-std=c++17",
+    "-std=c++20",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "--use_fast_math",

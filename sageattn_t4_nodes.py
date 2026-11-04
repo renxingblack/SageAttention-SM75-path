@@ -10,7 +10,7 @@ so the node appears automatically in ComfyUI's node menu under
 category "SageAttention-T4" — no manual copying needed.
 """
 
-from comfyui_nodes.sageattention_node import SageAttentionNode, SageAttentionRemoveNode
+from .comfyui_nodes.sageattention_node import SageAttentionNode, SageAttentionRemoveNode
 
 NODE_CLASS_MAPPINGS = {
     "SageAttentionT4_Apply": SageAttentionNode,
